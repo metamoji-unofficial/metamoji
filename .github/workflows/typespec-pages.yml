@@ -1,12 +1,17 @@
 name: Deploy TypeSpec docs to Pages
 
+# TypeSpec のソースは private な docs submodule (metamoji-unofficial/docs) にある。
+# Free プランでは private リポジトリの Pages が使えないため、public なこのリポジトリで
+# ビルドし、生成した API ドキュメント HTML だけを公開する。解析 md は公開されない。
+#
+# docs 側を更新しただけではこのワークフローは動かない。親リポジトリで submodule の
+# ポインタを進めて push するか、workflow_dispatch で手動実行すること。
+
 on:
   push:
     branches: [main]
     paths:
-      - "docs/typespec/**/*.tsp"
-      - "docs/typespec/tspconfig.yaml"
-      - "docs/typespec/package.json"
+      - "docs"
       - ".github/workflows/typespec-pages.yml"
   workflow_dispatch:
 
@@ -22,25 +27,40 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: docs/typespec
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Resolve docs submodule commit
+        id: docs
+        run: echo "sha=$(git rev-parse HEAD:docs)" >> "$GITHUB_OUTPUT"
+
+      # GITHUB_TOKEN はこのリポジトリにしか通用しないので、private な docs は
+      # 専用の PAT で別途チェックアウトする。submodule として取得しないのは、
+      # actions/checkout が submodule を個別指定できず apk まで巻き込むため。
+      - name: Checkout docs
+        uses: actions/checkout@v4
+        with:
+          repository: metamoji-unofficial/docs
+          ref: ${{ steps.docs.outputs.sha }}
+          token: ${{ secrets.DOCS_REPO_TOKEN }}
+          path: docs
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       - name: Install dependencies
+        working-directory: docs/typespec
         run: npm ci
 
       - name: Compile TypeSpec
+        working-directory: docs/typespec
         run: npm run build
 
       - name: Generate HTML docs from OpenAPI spec
+        working-directory: docs/typespec
         run: |
           mkdir -p site
           npx --yes @redocly/cli build-docs \
