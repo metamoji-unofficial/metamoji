@@ -19,7 +19,7 @@
  */
 
 import { buildStrokePath } from "../model/stroke";
-import { rectIntersects } from "../model/stroke";
+import { rectIntersects, unionRect } from "../model/stroke";
 import type { Layer, Page, Rect, Stroke, Unit } from "../model/types";
 import { drawChart } from "./chart";
 import { visibleWorldRect, type Viewport } from "./viewport";
@@ -120,6 +120,15 @@ function drawLayer(
 }
 
 export function unitBounds(unit: Unit): Rect {
+  // A $draw unit's own x/y/width/height are nominal (drawing ignores them
+  // apart from rotation, see drawInkUnit below); culling against them instead
+  // of the strokes' real coordinates can hide every stroke on the page the
+  // moment something shifts that nominal position. Cull against where the
+  // ink actually is.
+  if (unit.type === "$draw") {
+    if (unit.strokes.length === 0) return { x: unit.x, y: unit.y, width: 0, height: 0 };
+    return unit.strokes.reduce<Rect>((acc, s) => unionRect(acc, s.bounds), unit.strokes[0].bounds);
+  }
   return { x: unit.x, y: unit.y, width: unit.width, height: unit.height };
 }
 
