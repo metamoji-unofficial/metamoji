@@ -1,5 +1,5 @@
-[submodule "metamoji-api"]
-	path = metamoji-api
+[submodule "sdk"]
+	path = sdk
 	url = https://github.com/metamoji-unofficial/sdk
 [submodule "apk"]
 	path = apk
