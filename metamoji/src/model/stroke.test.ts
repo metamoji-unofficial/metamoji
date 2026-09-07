@@ -1,8 +1,33 @@
 import { describe, expect, it } from "vitest";
 
-import { distanceToStroke, simplify, strokeBounds, widthAt } from "./stroke";
+import { distanceToStroke, simplify, strokeBounds, strokeOutlineShapes, widthAt } from "./stroke";
+import type { StrokeShape } from "./stroke";
 import { screenToWorld, worldToScreen, zoomAbout, clampScale, fitRect } from "../render/viewport";
 import type { InkPoint, PenAttributes, Stroke } from "./types";
+
+/** Point-in-union test mirroring what a nonzero-rule Canvas fill computes. */
+function isCovered(shapes: StrokeShape[], x: number, y: number): boolean {
+  return shapes.some((shape) => {
+    if (shape.kind === "circle") return Math.hypot(x - shape.cx, y - shape.cy) <= shape.r;
+    const [a, b, c, d] = shape.pts;
+    return pointInQuad(x, y, a, b, c, d);
+  });
+}
+
+function pointInQuad(
+  x: number, y: number,
+  a: { x: number; y: number }, b: { x: number; y: number },
+  c: { x: number; y: number }, d: { x: number; y: number },
+): boolean {
+  const cross = (p: typeof a, q: typeof a) => (q.x - p.x) * (y - p.y) - (q.y - p.y) * (x - p.x);
+  const s1 = Math.sign(cross(a, b));
+  const s2 = Math.sign(cross(b, c));
+  const s3 = Math.sign(cross(c, d));
+  const s4 = Math.sign(cross(d, a));
+  const allNonNeg = s1 >= 0 && s2 >= 0 && s3 >= 0 && s4 >= 0;
+  const allNonPos = s1 <= 0 && s2 <= 0 && s3 <= 0 && s4 <= 0;
+  return allNonNeg || allNonPos;
+}
 
 const pen: PenAttributes = {
   color: "#000000",
@@ -83,6 +108,32 @@ describe("stroke geometry", () => {
 
   it("distance to an empty stroke is infinite rather than NaN", () => {
     expect(distanceToStroke(stroke([]), 0, 0)).toBe(Infinity);
+  });
+
+  it("fills solid when the pen loops back over itself tighter than its own width", () => {
+    // A tiny scribble: the loop's radius (1) is smaller than the pen's half-width
+    // (2 for this 4-wide pen), so the whole disc the tip sweeps should be covered,
+    // including dead centre. The old offset-outline approach left a hole there
+    // because the two offset sides crossed and the fill rule read it as empty.
+    const points: InkPoint[] = [];
+    for (let i = 0; i <= 120; i++) {
+      const t = (i / 40) * Math.PI * 2;
+      points.push({ x: 30 + 1 * Math.cos(t), y: 30 + 1 * Math.sin(t), p: 0.5, t: i });
+    }
+    const shapes = strokeOutlineShapes(stroke(points));
+    expect(isCovered(shapes, 30, 30)).toBe(true);
+  });
+
+  it("a loop wider than the pen still leaves its centre unpainted", () => {
+    // Sanity check for the test above: a loop bigger than the pen never sweeps
+    // its own centre, so that hole is physically correct and must stay a hole.
+    const points: InkPoint[] = [];
+    for (let i = 0; i <= 120; i++) {
+      const t = (i / 40) * Math.PI * 2;
+      points.push({ x: 30 + 12 * Math.cos(t), y: 30 + 12 * Math.sin(t), p: 0.5, t: i });
+    }
+    const shapes = strokeOutlineShapes(stroke(points));
+    expect(isCovered(shapes, 30, 30)).toBe(false);
   });
 });
 

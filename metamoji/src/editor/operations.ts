@@ -10,7 +10,7 @@
 
 import type { EditSession } from "./session";
 import { newStrokeId, newUnitId } from "../model/ids";
-import { recomputeBounds } from "../model/stroke";
+import { recomputeBounds, unionRect } from "../model/stroke";
 import type { Layer, ModelId, NoteDocument, Page, Unit } from "../model/types";
 import { currentLayer } from "../model/types";
 
@@ -50,17 +50,22 @@ export function cloneUnit(unit: Unit, offset = 0): Unit {
   };
 
   if (base.type === "$draw") {
-    return {
-      ...base,
-      strokes: base.strokes.map((stroke) =>
-        recomputeBounds({
-          ...stroke,
-          id: newStrokeId(),
-          points: stroke.points.map((p) => ({ ...p })),
-          pen: { ...stroke.pen },
-        }),
-      ),
-    };
+    // The stroke's points are its real position — x/y/width/height are only
+    // the selection outline (see stroke.ts) — so the offset has to move both,
+    // or the pasted copy's outline would land somewhere its ink isn't.
+    const strokes = base.strokes.map((stroke) =>
+      recomputeBounds({
+        ...stroke,
+        id: newStrokeId(),
+        points: stroke.points.map((p) => ({ ...p, x: p.x + offset, y: p.y + offset })),
+        pen: { ...stroke.pen },
+      }),
+    );
+    const bounds = strokes.reduce(
+      (acc, s) => unionRect(acc, s.bounds),
+      strokes[0]?.bounds ?? { x: base.x, y: base.y, width: 0, height: 0 },
+    );
+    return { ...base, ...bounds, strokes };
   }
   return base;
 }
