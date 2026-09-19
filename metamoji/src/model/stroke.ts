@@ -76,75 +76,101 @@ export function simplify(points: InkPoint[], minDist = 0.7): InkPoint[] {
   return out;
 }
 
+/** A circular pen dab, centred on one sample. */
+export interface StrokeCircle {
+  kind: "circle";
+  cx: number;
+  cy: number;
+  r: number;
+}
+
+/** The quad bridging two consecutive dabs, tangent to both. */
+export interface StrokeQuad {
+  kind: "quad";
+  pts: [
+    { x: number; y: number },
+    { x: number; y: number },
+    { x: number; y: number },
+    { x: number; y: number },
+  ];
+}
+
+export type StrokeShape = StrokeCircle | StrokeQuad;
+
+/**
+ * The variable-width stroke as a set of shapes to union: a circle at every
+ * sample plus a bridging quad between each consecutive pair. Kept separate
+ * from `buildStrokePath` so the geometry can be checked without a real
+ * Canvas backend — see stroke.test.ts's self-overlap regression test.
+ */
+export function strokeOutlineShapes(stroke: Stroke): StrokeShape[] {
+  const pts = stroke.points;
+  const shapes: StrokeShape[] = [];
+
+  for (const pt of pts) {
+    shapes.push({ kind: "circle", cx: pt.x, cy: pt.y, r: widthAt(stroke.pen, pt.p) / 2 });
+  }
+
+  for (let i = 0; i < pts.length - 1; i++) {
+    const a = pts[i];
+    const b = pts[i + 1];
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    const len = Math.hypot(dx, dy);
+    if (len < 1e-6) continue;
+    dx /= len;
+    dy /= len;
+    // Perpendicular unit vector, scaled to each endpoint's half-width.
+    const px = -dy;
+    const py = dx;
+    const ra = widthAt(stroke.pen, a.p) / 2;
+    const rb = widthAt(stroke.pen, b.p) / 2;
+    shapes.push({
+      kind: "quad",
+      pts: [
+        { x: a.x + px * ra, y: a.y + py * ra },
+        { x: b.x + px * rb, y: b.y + py * rb },
+        { x: b.x - px * rb, y: b.y - py * rb },
+        { x: a.x - px * ra, y: a.y - py * ra },
+      ],
+    });
+  }
+
+  return shapes;
+}
+
 /**
  * Builds the filled outline of a variable-width stroke.
  *
- * We walk one side of the centreline offsetting by the half-width at each
- * sample, then walk back down the other side, giving a single closed polygon
- * that Canvas fills in one operation. The alternative — stamping a circle per
- * sample — costs one path op per sample and shows banding when the pen moves
- * fast, so the outline wins on both counts.
+ * The pen tip is a circle at each sample, bridged to its neighbour by a quad
+ * so fast strokes don't band between sparse samples. Each circle and quad is
+ * its own closed subpath inside one Path2D, and a single nonzero-rule fill
+ * unions them — so retracing the same spot (a tight scribble, a dot held in
+ * place) always fills solid, with no seams from the overlap.
  *
- * The centreline is smoothed with quadratic segments through sample midpoints,
- * the standard trick for turning a polyline into a curve without needing to
- * fit splines.
+ * An earlier version walked one offset side of the centreline and back down
+ * the other, producing a single closed polygon. That's cheaper per sample,
+ * but when the centreline loops back over itself tighter than the stroke's
+ * own width, the two offset sides cross and the nonzero fill rule reads the
+ * crossing as a hole — exactly the "line doesn't fill in" bug this avoids.
  */
 export function buildStrokePath(stroke: Stroke): Path2D {
-  const pts = stroke.points;
   const path = new Path2D();
-  if (pts.length === 0) return path;
 
-  if (pts.length === 1) {
-    const r = widthAt(stroke.pen, pts[0].p) / 2;
-    path.moveTo(pts[0].x + r, pts[0].y);
-    path.arc(pts[0].x, pts[0].y, r, 0, Math.PI * 2);
-    return path;
-  }
-
-  const left: { x: number; y: number }[] = [];
-  const right: { x: number; y: number }[] = [];
-
-  for (let i = 0; i < pts.length; i++) {
-    const prev = pts[i - 1] ?? pts[i];
-    const next = pts[i + 1] ?? pts[i];
-    let nx = next.x - prev.x;
-    let ny = next.y - prev.y;
-    const len = Math.hypot(nx, ny);
-    if (len < 1e-6) {
-      nx = 1;
-      ny = 0;
+  for (const shape of strokeOutlineShapes(stroke)) {
+    if (shape.kind === "circle") {
+      path.moveTo(shape.cx + shape.r, shape.cy);
+      path.arc(shape.cx, shape.cy, shape.r, 0, Math.PI * 2);
     } else {
-      nx /= len;
-      ny /= len;
+      path.moveTo(shape.pts[0].x, shape.pts[0].y);
+      path.lineTo(shape.pts[1].x, shape.pts[1].y);
+      path.lineTo(shape.pts[2].x, shape.pts[2].y);
+      path.lineTo(shape.pts[3].x, shape.pts[3].y);
     }
-    // Perpendicular, scaled to the half-width at this sample.
-    const r = widthAt(stroke.pen, pts[i].p) / 2;
-    const px = -ny * r;
-    const py = nx * r;
-    left.push({ x: pts[i].x + px, y: pts[i].y + py });
-    right.push({ x: pts[i].x - px, y: pts[i].y - py });
+    path.closePath();
   }
 
-  traceSide(path, left, true);
-  // Return along the other side, from the far end back to the start.
-  right.reverse();
-  traceSide(path, right, false);
-  path.closePath();
   return path;
-}
-
-function traceSide(path: Path2D, side: { x: number; y: number }[], start: boolean): void {
-  if (side.length === 0) return;
-  if (start) path.moveTo(side[0].x, side[0].y);
-  else path.lineTo(side[0].x, side[0].y);
-
-  for (let i = 1; i < side.length - 1; i++) {
-    const mx = (side[i].x + side[i + 1].x) / 2;
-    const my = (side[i].y + side[i + 1].y) / 2;
-    path.quadraticCurveTo(side[i].x, side[i].y, mx, my);
-  }
-  const last = side[side.length - 1];
-  path.lineTo(last.x, last.y);
 }
 
 /**

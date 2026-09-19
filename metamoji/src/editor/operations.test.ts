@@ -119,6 +119,42 @@ describe("duplicate", () => {
     copy.strokes[0].points[0].x = 999;
     expect(ink.strokes[0].points[0].x).toBe(0);
   });
+
+  it("offsets a duplicated ink unit's actual points, not just its outline", () => {
+    // x/y/width/height are only the selection outline for a $draw unit — the
+    // ink itself is the stroke's own points — so an offset that moved only
+    // the outline would paste a copy whose selection box sits somewhere its
+    // ink doesn't.
+    const points = [
+      { x: 0, y: 0, p: 0.5, t: 0 },
+      { x: 10, y: 10, p: 0.5, t: 5 },
+    ];
+    const ink: DrawUnit = {
+      id: "unit_ink",
+      type: "$draw",
+      x: 0,
+      y: 0,
+      width: 100,
+      height: 100,
+      rotation: 0,
+      contentScale: 1,
+      strokes: [
+        {
+          id: newStrokeId(),
+          points,
+          pen: { color: "#000", width: 2, penType: "ballpoint", opacity: 1, pressureSensitivity: 0.5 },
+          bounds: strokeBounds(points, 2),
+        },
+      ],
+    };
+
+    const copy = cloneUnit(ink, 24) as DrawUnit;
+    expect(copy.strokes[0].points[0].x).toBe(24);
+    expect(copy.strokes[0].points[0].y).toBe(24);
+    // The outline must track where the offset points actually landed.
+    expect(copy.x).toBe(copy.strokes[0].bounds.x);
+    expect(copy.y).toBe(copy.strokes[0].bounds.y);
+  });
 });
 
 describe("clipboard", () => {

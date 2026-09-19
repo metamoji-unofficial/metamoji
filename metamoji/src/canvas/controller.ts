@@ -108,8 +108,16 @@ interface Gesture {
   startWorld: Point;
   lastScreen: Point;
   handle?: HandleType;
-  /** Geometry of the units being transformed, captured at gesture start. */
-  originals?: Map<ModelId, Pick<Unit, "x" | "y" | "width" | "height" | "rotation">>;
+  /**
+   * Geometry of the units being transformed, captured at gesture start. A
+   * $draw unit's x/y/width/height are only its selection outline — its ink is
+   * the stroke itself, so moving one also needs the stroke's own original
+   * points to translate from.
+   */
+  originals?: Map<
+    ModelId,
+    Pick<Unit, "x" | "y" | "width" | "height" | "rotation"> & { strokes?: Stroke[] }
+  >;
   marquee?: Rect;
   erased?: Set<string>;
   /** Lasso path and laser trail, both in world coordinates. */
@@ -535,7 +543,9 @@ export class CanvasController {
       ctx.lineWidth = 1.5 / this.viewport.scale;
       ctx.strokeRect(unit.x, unit.y, unit.width, unit.height);
 
-      if (units.length === 1) {
+      // Ink only supports moving, not resizing or rotating — showing handles
+      // that don't do anything would just invite a dead drag.
+      if (units.length === 1 && unit.type !== "$draw") {
         const positions = handlePositions(unit);
         const size = HANDLE_SIZE / this.viewport.scale;
         ctx.fillStyle = canvasTheme().handleFill;
@@ -725,7 +735,10 @@ export class CanvasController {
   }
 
   private captureGeometry(page: Page, ids: ModelId[]) {
-    const map = new Map<ModelId, Pick<Unit, "x" | "y" | "width" | "height" | "rotation">>();
+    const map = new Map<
+      ModelId,
+      Pick<Unit, "x" | "y" | "width" | "height" | "rotation"> & { strokes?: Stroke[] }
+    >();
     for (const layer of page.layers) {
       for (const unit of layer.units) {
         if (!ids.includes(unit.id)) continue;
@@ -735,6 +748,10 @@ export class CanvasController {
           width: unit.width,
           height: unit.height,
           rotation: unit.rotation,
+          strokes:
+            unit.type === "$draw"
+              ? unit.strokes.map((s) => ({ ...s, points: s.points.slice() }))
+              : undefined,
         });
       }
     }
@@ -866,7 +883,24 @@ export class CanvasController {
       if (!located) continue;
 
       let after: Partial<Unit>;
-      if (gesture.kind === "move") {
+      if (located.unit.type === "$draw") {
+        // A $draw unit's x/y/width/height are only its selection outline —
+        // the ink itself is the stroke's own recorded points, so moving it
+        // means translating those (and refreshing the outline to match).
+        // Resizing/rotating stroke geometry isn't implemented, so anything
+        // but a plain move is a no-op here.
+        const stroke = original.strokes?.[0];
+        if (gesture.kind !== "move" || !stroke) continue;
+        const points = stroke.points.map((p) => ({ ...p, x: p.x + dx, y: p.y + dy }));
+        const bounds = strokeBounds(points, stroke.pen.width);
+        after = {
+          x: bounds.x,
+          y: bounds.y,
+          width: bounds.width,
+          height: bounds.height,
+          strokes: [{ ...stroke, points, bounds }],
+        } as Partial<Unit>;
+      } else if (gesture.kind === "move") {
         after = { x: original.x + dx, y: original.y + dy };
       } else if (gesture.handle === "rotate") {
         const cx = original.x + original.width / 2;
@@ -883,7 +917,7 @@ export class CanvasController {
         pageId: page.id,
         layerId: located.layerId,
         unitId,
-        before: original,
+        before: original as Partial<Unit>,
         after,
       });
     }
@@ -915,14 +949,28 @@ export class CanvasController {
           // Every erase in one drag folds into a single undo entry, so undo
           // restores the whole sweep rather than one stroke at a time.
           session.beginEdit("消しゴム");
-          session.record({
-            kind: "stroke.remove",
-            pageId: page.id,
-            layerId: layer.id,
-            unitId: unit.id,
-            index: i,
-            stroke,
-          });
+          if (unit.strokes.length === 1) {
+            // The common case: a stroke has its own unit, so erasing it means
+            // removing that unit rather than leaving an empty one behind.
+            session.record({
+              kind: "unit.remove",
+              pageId: page.id,
+              layerId: layer.id,
+              index: layer.units.indexOf(unit),
+              unit,
+            });
+          } else {
+            // A unit still carrying more than one stroke — from an imported
+            // note, or a remote peer's — only loses the one stroke erased.
+            session.record({
+              kind: "stroke.remove",
+              pageId: page.id,
+              layerId: layer.id,
+              unitId: unit.id,
+              index: i,
+              stroke,
+            });
+          }
           session.endEdit();
           this.sceneDirty = true;
         }
@@ -1015,31 +1063,22 @@ export class CanvasController {
       return;
     }
 
-    // New ink goes into the layer's ink unit, creating one on first use rather
-    // than making every note carry an empty one.
-    let inkUnit = layer.units.find((u) => u.type === "$draw");
+    // Each stroke gets its own $draw unit, sized to its own bounds, so it can
+    // be selected and moved independently of every other stroke on the layer.
+    const unit = createDrawUnit();
+    unit.x = stroke.bounds.x;
+    unit.y = stroke.bounds.y;
+    unit.width = stroke.bounds.width;
+    unit.height = stroke.bounds.height;
+    unit.strokes = [stroke];
 
     session.transact("ペン", () => {
-      if (!inkUnit) {
-        const created = createDrawUnit();
-        created.width = page.paperWidth;
-        created.height = page.paperHeight;
-        session.record({
-          kind: "unit.add",
-          pageId: page.id,
-          layerId: layer.id,
-          index: layer.units.length,
-          unit: created,
-        });
-        inkUnit = created;
-      }
       session.record({
-        kind: "stroke.add",
+        kind: "unit.add",
         pageId: page.id,
         layerId: layer.id,
-        unitId: inkUnit.id,
-        index: inkUnit.type === "$draw" ? inkUnit.strokes.length : 0,
-        stroke,
+        index: layer.units.length,
+        unit,
       });
     });
 

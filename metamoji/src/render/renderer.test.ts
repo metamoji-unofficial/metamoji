@@ -14,8 +14,10 @@
 
 import { describe, expect, it } from "vitest";
 
-import { renderPage } from "./renderer";
-import { createDocument } from "../model/factory";
+import { renderPage, unitBounds } from "./renderer";
+import { createDocument, createDrawUnit } from "../model/factory";
+import { strokeBounds } from "../model/stroke";
+import type { InkPoint, PenAttributes } from "../model/types";
 
 interface Call {
   op: string;
@@ -101,5 +103,41 @@ describe("renderPage", () => {
     expect(paperFills(render({ pageShadow: true }))).toBe(
       paperFills(render({})) + 1,
     );
+  });
+});
+
+describe("unitBounds", () => {
+  const pen: PenAttributes = {
+    color: "#000000",
+    width: 4,
+    penType: "ballpoint",
+    opacity: 1,
+    pressureSensitivity: 0,
+  };
+
+  it("culls a $draw unit against its strokes, not its nominal page-sized frame", () => {
+    // The bug: a $draw unit's x/y are nominal — its strokes render at their
+    // own recorded coordinates regardless of them — but an errant unit.update
+    // (e.g. a stray drag that bundled the $draw unit into a multi-select) can
+    // still shift x/y far off-screen. Bounds keyed on the nominal frame would
+    // then say "off-screen" for a page whose ink is still sitting in view.
+    const points: InkPoint[] = [{ x: 50, y: 60, p: 0.5, t: 0 }];
+    const unit = createDrawUnit();
+    unit.x = -5000;
+    unit.y = -5000;
+    unit.strokes = [
+      { id: "s", points, pen, bounds: strokeBounds(points, pen.width) },
+    ];
+
+    const bounds = unitBounds(unit);
+    expect(bounds.x).toBeLessThanOrEqual(50);
+    expect(bounds.x + bounds.width).toBeGreaterThanOrEqual(50);
+    expect(bounds.y).toBeLessThanOrEqual(60);
+    expect(bounds.y + bounds.height).toBeGreaterThanOrEqual(60);
+  });
+
+  it("gives an empty $draw unit a zero-size rect at its own position", () => {
+    const unit = createDrawUnit();
+    expect(unitBounds(unit)).toEqual({ x: 0, y: 0, width: 0, height: 0 });
   });
 });
