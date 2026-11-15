@@ -11,10 +11,12 @@ import { useNavigate } from "react-router";
 
 import { Icon } from "../components/Icon";
 import * as api from "../ipc/api";
+import { isTauri } from "../ipc/api";
 import type { AppStatus } from "../ipc/api";
 import { LOCALE_NAMES, setLocale, type Locale } from "../i18n";
 import { useTranslation } from "../i18n/useTranslation";
 import { usePrefs } from "../store/prefsStore";
+import { useUpdateStore } from "../store/updateStore";
 
 const AUTOSAVE_CHOICES = [1, 2, 5, 10];
 
@@ -23,10 +25,26 @@ export function SettingsScreen() {
   const { t, locale } = useTranslation();
   const prefs = usePrefs();
   const [status, setStatus] = useState<AppStatus | null>(null);
+  const [appVersion, setAppVersion] = useState<string | null>(null);
 
   useEffect(() => {
     void api.appStatus().then(setStatus).catch(() => setStatus(null));
   }, []);
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    void import("@tauri-apps/api/app")
+      .then((app) => app.getVersion())
+      .then(setAppVersion)
+      .catch(() => setAppVersion(null));
+  }, []);
+
+  const updateStatus = useUpdateStore((s) => s.status);
+  const updateVersion = useUpdateStore((s) => s.version);
+  const updateProgress = useUpdateStore((s) => s.progress);
+  const updateError = useUpdateStore((s) => s.error);
+  const checkForUpdate = useUpdateStore((s) => s.check);
+  const installUpdate = useUpdateStore((s) => s.install);
 
   return (
     <div className="app">
@@ -112,6 +130,39 @@ export function SettingsScreen() {
             <label>{t("スキーマバージョン")}</label>
             <code className="setting-value">{status?.schemaVersion ?? "—"}</code>
           </div>
+          <div className="setting-row">
+            <label>{t("バージョン")}</label>
+            <code className="setting-value">{appVersion ?? "—"}</code>
+          </div>
+          <div className="setting-row">
+            <label>{t("アップデート")}</label>
+            {updateStatus === "available" ? (
+              <button type="button" className="btn btn--text" onClick={() => void installUpdate()}>
+                {t("{version} をインストール", { version: updateVersion ?? "" })}
+              </button>
+            ) : updateStatus === "installing" ? (
+              <span>
+                {updateProgress != null
+                  ? t("インストール中… {progress}%", { progress: updateProgress })
+                  : t("インストール中…")}
+              </span>
+            ) : (
+              <button
+                type="button"
+                className="btn btn--text"
+                disabled={!isTauri() || updateStatus === "checking"}
+                onClick={() => void checkForUpdate()}
+              >
+                {updateStatus === "checking" ? t("確認中…") : t("アップデートを確認")}
+              </button>
+            )}
+          </div>
+          {updateStatus === "upToDate" && (
+            <p className="setting-note">{t("最新バージョンです。")}</p>
+          )}
+          {updateStatus === "error" && (
+            <p className="setting-note">{t("アップデートの確認に失敗しました: {error}", { error: updateError ?? "" })}</p>
+          )}
         </section>
       </main>
     </div>

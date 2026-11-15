@@ -2,6 +2,8 @@ import { useEffect } from "react";
 import { createHashRouter, RouterProvider } from "react-router";
 
 import { useAuthStore } from "./store/authStore";
+import { useUpdateStore } from "./store/updateStore";
+import { UpdateToast } from "./components/UpdateToast";
 import { EditorScreen } from "./screens/EditorScreen";
 import { LibraryScreen } from "./screens/LibraryScreen";
 import { ClassroomScreen } from "./screens/ClassroomScreen";
@@ -32,5 +34,17 @@ export default function App() {
     void init();
   }, [init]);
 
-  return <RouterProvider router={router} />;
+  // Silent — the toast only appears once this finds something, and a failed
+  // check (offline, rate-limited) is not worth surfacing on every launch.
+  const checkForUpdate = useUpdateStore((s) => s.check);
+  useEffect(() => {
+    void checkForUpdate();
+  }, [checkForUpdate]);
+
+  return (
+    <>
+      <RouterProvider router={router} />
+      <UpdateToast />
+    </>
+  );
 }
