@@ -846,3 +846,66 @@ export async function classboxList(): Promise<DriveEntry[]> {
   requireTauri();
   return invoke<DriveEntry[]>("classbox_list");
 }
+
+/** One note's background, saved to disk. */
+export interface SavedBackground {
+  documentId: string;
+  title: string | null;
+  /** File names written, relative to the folder the download was into. */
+  files: string[];
+}
+
+/** A note with no background to download — not a failure. */
+export interface SkippedNote {
+  documentId: string;
+  title: string | null;
+  reason: string;
+}
+
+export interface FailedNote {
+  documentId: string;
+  title: string | null;
+  error: string;
+}
+
+/** What downloading a class-box folder found. */
+export interface FolderDownloadResult {
+  /** Notes under the folder, subfolders included. */
+  total: number;
+  saved: SavedBackground[];
+  skipped: SkippedNote[];
+  failed: FailedNote[];
+}
+
+/**
+ * Downloads every note's background (PDF or image, no handwriting) under a
+ * class-box folder into `destDir`. Subfolders are included and mirrored on
+ * disk, matching `DriveFolder`'s own hierarchy.
+ */
+export async function classboxDownloadFolder(
+  driveId: string,
+  folderPath: string,
+  destDir: string,
+): Promise<FolderDownloadResult> {
+  requireTauri();
+  return invoke<FolderDownloadResult>("classbox_download_folder", {
+    driveId,
+    folderPath,
+    destDir,
+  });
+}
+
+/** How far a folder download has gotten. */
+export interface DownloadProgress {
+  done: number;
+  total: number;
+  /** The note about to download, or `null` once the last one is done. */
+  title: string | null;
+}
+
+export async function onClassboxDownloadProgress(
+  fn: (progress: DownloadProgress) => void,
+): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  return listen<DownloadProgress>("classbox://download-progress", (e) => fn(e.payload));
+}

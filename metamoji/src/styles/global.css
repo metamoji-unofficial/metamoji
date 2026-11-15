@@ -1572,6 +1572,19 @@ input.layer-row__name {
   white-space: nowrap;
 }
 
+/* Breadcrumbs plus the per-folder actions — currently just the download
+   button — on the trailing edge of the same row. */
+.box-toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin-bottom: var(--space-4);
+}
+
+.box-toolbar .breadcrumbs {
+  margin-bottom: 0;
+}
+
 .breadcrumbs {
   display: flex;
   flex-wrap: wrap;

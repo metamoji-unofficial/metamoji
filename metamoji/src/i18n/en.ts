@@ -316,6 +316,12 @@ export const en: Record<string, string> = {
   "中身を解釈できませんでした({count} 件のレコード、未知の項目: {types})。":
     "Could not read the contents ({count} records; unrecognised entries: {types}).",
   "端末に複製して開きます": "Opens as a copy on this device",
+  "このフォルダ内をすべてダウンロード": "Download everything in this folder",
+  "ダウンロードしています…": "Downloading…",
+  "ダウンロードしています… {done} / {total}": "Downloading… {done} / {total}",
+  "ダウンロードしています… {done} / {total}({title})": "Downloading… {done} / {total} ({title})",
+  "{saved} 件を保存しました(背景なし: {skipped} 件、失敗: {failed} 件)":
+    "Saved {saved} notes (no background: {skipped}, failed: {failed})",
   "参加者": "Participants",
   "参加している人はいません。": "Nobody has joined.",
   "共同編集": "Shared editing",
