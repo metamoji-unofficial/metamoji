@@ -225,6 +225,20 @@ export const en: Record<string, string> = {
   "情報": "About",
   "スキーマバージョン": "Schema version",
   "手書き文字認識": "Handwriting recognition",
+  "バージョン": "Version",
+
+  // -- updates ----------------------------------------------------------------
+  "アップデート": "Update",
+  "アップデートを確認": "Check for updates",
+  "{version} をインストール": "Install {version}",
+  "インストール中…": "Installing…",
+  "インストール中… {progress}%": "Installing… {progress}%",
+  "最新バージョンです。": "You're on the latest version.",
+  "アップデートの確認に失敗しました: {error}": "Failed to check for updates: {error}",
+  "新しいバージョン {version} が利用可能です。": "Version {version} is available.",
+  "アップデートをダウンロード中…": "Downloading update…",
+  "アップデートをダウンロード中… {progress}%": "Downloading update… {progress}%",
+  "今すぐインストール": "Install now",
 
   // -- sign-in ---------------------------------------------------------------
   "サインイン": "Sign in",
