@@ -46,7 +46,10 @@
         "role": "Editor"
       }
     ],
-    "createUpdaterArtifacts": true
+    "createUpdaterArtifacts": true,
+    "macOS": {
+      "signingIdentity": "-"
+    }
   },
   "plugins": {
     "updater": {
