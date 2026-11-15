@@ -5,17 +5,18 @@
 //! filesystem. That is why neither `tauri-plugin-fs` nor `tauri-plugin-sql` is
 //! installed — both would hand the webview capabilities it has no use for.
 
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
-use tauri::State;
+use tauri::{Emitter, State};
 
 use crate::cloud::{ClassGroup, CloudClient, CloudSession, DriveEntry, School};
 use crate::collabo::{
     self,
     session::{ClassroomState, CollaboMember, CollaboRoom, EnterResult},
 };
-use crate::drive::{self, listing::Listing, DriveClient};
+use crate::drive::{self, listing::Listing, DriveClient, DriveDocument};
 use crate::error::{AppError, AppResult};
 use crate::model::{AppStatus, GenericTree, NoteSummary};
 use crate::state::AppState;
@@ -641,9 +642,21 @@ pub async fn classbox_open(
     drive: State<'_, DriveClient>,
     drive_id: String,
 ) -> AppResult<Listing> {
-    // Four calls to two different services. Naming the step in the error is
-    // what turns "could not open the class" into something actionable — the
-    // steps fail for very different reasons and are fixed in different files.
+    open_drive_listing(&cloud, &drive, &drive_id).await
+}
+
+/// Signs into a drive and reads its listing.
+///
+/// Shared by `classbox_open` and `classbox_download_folder`: both need the
+/// same four calls to two different services before they can do anything
+/// else, and naming the step in the error is what turns "could not open the
+/// class" into something actionable — the steps fail for very different
+/// reasons and are fixed in different files.
+async fn open_drive_listing(
+    cloud: &CloudClient,
+    drive: &DriveClient,
+    drive_id: &str,
+) -> AppResult<Listing> {
     let step = |name: &'static str| move |e: AppError| step_failed(name, e);
 
     // A session stored by an older build may lack the user id the drive service
@@ -655,7 +668,7 @@ pub async fn classbox_open(
         .map_err(step("サインインの更新"))?;
 
     let home = cloud
-        .drive_home(&drive_id)
+        .drive_home(drive_id)
         .await
         .map_err(step("場所の取得"))?;
     let (user_id, password, qwd) = cloud
@@ -669,12 +682,12 @@ pub async fn classbox_open(
     // Announces the sync before reading; the original always does, and a drive
     // that refuses it will refuse the read too — better to find out here.
     drive
-        .sync_start(&drive_id)
+        .sync_start(drive_id)
         .await
         .map_err(step("同期の開始"))?;
 
     let file = drive
-        .drive_data(&drive_id, None)
+        .drive_data(drive_id, None)
         .await
         .map_err(step("中身の取得"))?;
     drive::listing::parse(file.bytes).map_err(step("中身の解釈"))
@@ -1147,6 +1160,253 @@ pub(crate) fn store_imported_assets(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Class box folder download
+// ---------------------------------------------------------------------------
+//
+// Issue #10: a teacher wants a folder's handouts on disk, without opening each
+// note by hand. Scoped deliberately small — "no writing, background only" is
+// the issue's own words — so this does not reuse `classbox_open_note`: that
+// one also pulls the classroom's room history, which is exactly the writing
+// this is not supposed to bring along. What it shares with that command is the
+// one step that matters here too: importing the `.atdoc` container lifts the
+// embedded PDF/image out of the model tree (see `atdoc::assets`), and the tree
+// itself — strokes included — is discarded without ever being written.
+
+/// What downloading a folder found. A note with no background is `skipped`,
+/// not `failed`: a blank page or a hand-drawn-only note is not an error.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderDownloadResult {
+    /// Notes under the folder, subfolders included.
+    pub total: usize,
+    pub saved: Vec<SavedBackground>,
+    pub skipped: Vec<SkippedNote>,
+    pub failed: Vec<FailedNote>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedBackground {
+    pub document_id: String,
+    pub title: Option<String>,
+    /// File names written, relative to the folder the user chose.
+    pub files: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkippedNote {
+    pub document_id: String,
+    pub title: Option<String>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FailedNote {
+    pub document_id: String,
+    pub title: Option<String>,
+    pub error: String,
+}
+
+const DOWNLOAD_PROGRESS_EVENT: &str = "classbox://download-progress";
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadProgress {
+    done: usize,
+    total: usize,
+    /// The note about to be downloaded, or `None` once the last one is done.
+    title: Option<String>,
+}
+
+/// Downloads the background (PDF or image) of every note under a class-box
+/// folder, subfolders included, into `dest_dir`.
+///
+/// No handwriting comes along — not the student's own, not the room's — only
+/// the material the note was built on. Subfolders are mirrored under
+/// `dest_dir` so notes from two different folders never collide; one note
+/// failing does not stop the rest, and everything that happened is in the
+/// returned report rather than in a half-finished download the user has to
+/// guess about.
+#[tauri::command]
+pub async fn classbox_download_folder(
+    app: tauri::AppHandle,
+    cloud: State<'_, CloudClient>,
+    drive: State<'_, DriveClient>,
+    drive_id: String,
+    folder_path: String,
+    dest_dir: String,
+) -> AppResult<FolderDownloadResult> {
+    let listing = open_drive_listing(&cloud, &drive, &drive_id).await?;
+    // `folder_path` and every `folder_path` on a document are both
+    // `drive::listing::normalise_path` output — slash-delimited, a slash at
+    // each end — so a plain prefix match is also an exact subtree match: a
+    // folder name can't contain the `/` that bounds it.
+    let documents: Vec<DriveDocument> = listing
+        .documents
+        .into_iter()
+        .filter(|d| d.folder_path.starts_with(&folder_path))
+        .collect();
+
+    let total = documents.len();
+    let mut result = FolderDownloadResult {
+        total,
+        ..Default::default()
+    };
+    // Keyed by destination directory rather than one set for the whole
+    // download: two notes of the same name in two different subfolders are no
+    // collision at all.
+    let mut used: HashMap<PathBuf, HashSet<String>> = HashMap::new();
+
+    for (done, doc) in documents.into_iter().enumerate() {
+        let _ = app.emit(
+            DOWNLOAD_PROGRESS_EVENT,
+            &DownloadProgress {
+                done,
+                total,
+                title: doc.title.clone(),
+            },
+        );
+
+        let document_id = doc.document_id.clone();
+        let title = doc.title.clone();
+        match download_note_background(&drive, &drive_id, &doc, &folder_path, &dest_dir, &mut used)
+            .await
+        {
+            Ok(Some(files)) => result.saved.push(SavedBackground {
+                document_id,
+                title,
+                files,
+            }),
+            Ok(None) => result.skipped.push(SkippedNote {
+                document_id,
+                title,
+                reason: "背景(PDF・画像)がありません".to_string(),
+            }),
+            Err(err) => result.failed.push(FailedNote {
+                document_id,
+                title,
+                error: err.to_string(),
+            }),
+        }
+    }
+
+    let _ = app.emit(
+        DOWNLOAD_PROGRESS_EVENT,
+        &DownloadProgress {
+            done: total,
+            total,
+            title: None,
+        },
+    );
+    Ok(result)
+}
+
+/// One note's background, saved under `dest_dir`. `Ok(None)` means the note
+/// has none to save, which is not a failure.
+async fn download_note_background(
+    drive: &DriveClient,
+    drive_id: &str,
+    doc: &DriveDocument,
+    folder_path: &str,
+    dest_dir: &str,
+    used: &mut HashMap<PathBuf, HashSet<String>>,
+) -> AppResult<Option<Vec<String>>> {
+    let file = drive
+        .document_data(drive_id, &doc.document_id, doc.revision.as_deref())
+        .await?;
+    // The tree this builds is thrown away unwritten — strokes included. Only
+    // the assets lifted out of it are kept, which is the same lift every
+    // `.atdoc` import already does (`atdoc::assets`).
+    let imported = crate::atdoc::import(file.bytes, &doc.document_id)?;
+    let backgrounds: Vec<_> = imported.assets.into_iter().filter(|a| a.named).collect();
+    if backgrounds.is_empty() {
+        return Ok(None);
+    }
+
+    let dir = sub_directory(dest_dir, folder_path, &doc.folder_path);
+    std::fs::create_dir_all(&dir)?;
+    let used_here = used.entry(dir.clone()).or_default();
+
+    let title = doc.title.as_deref().unwrap_or(&doc.document_id);
+    let base = sanitise_filename(title);
+
+    let mut files = Vec::new();
+    for (index, asset) in backgrounds.iter().enumerate() {
+        let stem = if backgrounds.len() > 1 {
+            format!("{base}_{}", index + 1)
+        } else {
+            base.clone()
+        };
+        let name = unique_filename(used_here, &dir, &stem, extension_for(&asset.mime));
+        std::fs::write(dir.join(&name), &asset.bytes)?;
+        used_here.insert(name.clone());
+        files.push(name);
+    }
+    Ok(Some(files))
+}
+
+/// Where one note's files land: `dest_dir`, plus whatever the note's own
+/// folder adds beyond the folder the user chose to download — the same
+/// hierarchy `drive::listing` already reads, carried onto disk.
+fn sub_directory(dest_dir: &str, folder_path: &str, doc_folder_path: &str) -> PathBuf {
+    let rest = doc_folder_path
+        .strip_prefix(folder_path)
+        .unwrap_or(doc_folder_path)
+        .trim_matches('/');
+    if rest.is_empty() {
+        PathBuf::from(dest_dir)
+    } else {
+        PathBuf::from(dest_dir).join(rest)
+    }
+}
+
+/// Characters no mainstream filesystem accepts in a file name, plus the ones
+/// only Windows refuses — this build runs on both.
+const INVALID_FILENAME_CHARS: [char; 9] = ['/', '\\', ':', '*', '?', '"', '<', '>', '|'];
+
+fn sanitise_filename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c.is_control() || INVALID_FILENAME_CHARS.contains(&c) {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim().trim_matches('.').trim();
+    if trimmed.is_empty() {
+        "note".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn extension_for(mime: &str) -> &'static str {
+    match mime {
+        "application/pdf" => "pdf",
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        _ => "bin",
+    }
+}
+
+/// `{stem}.{ext}`, or `{stem} (2).{ext}`, … — whichever name neither this run
+/// nor the directory itself already holds.
+fn unique_filename(used: &HashSet<String>, dir: &Path, stem: &str, ext: &str) -> String {
+    let mut candidate = format!("{stem}.{ext}");
+    let mut n = 2;
+    while used.contains(&candidate) || dir.join(&candidate).exists() {
+        candidate = format!("{stem} ({n}).{ext}");
+        n += 1;
+    }
+    candidate
+}
+
 #[tauri::command]
 pub async fn classbox_note_thumbnail(
     drive: State<'_, DriveClient>,
@@ -1167,4 +1427,60 @@ pub async fn classbox_note_thumbnail(
 #[tauri::command]
 pub fn classbox_close(drive: State<'_, DriveClient>) {
     drive.sign_out();
+}
+
+#[cfg(test)]
+mod folder_download_tests {
+    use super::*;
+
+    #[test]
+    fn a_title_with_path_characters_becomes_a_plain_file_name() {
+        assert_eq!(sanitise_filename("配布/資料?.pdf"), "配布 資料 .pdf");
+    }
+
+    #[test]
+    fn a_title_that_sanitises_to_nothing_falls_back() {
+        assert_eq!(sanitise_filename("   "), "note");
+        assert_eq!(sanitise_filename("///"), "note");
+    }
+
+    #[test]
+    fn mime_types_the_format_actually_embeds_get_their_usual_extension() {
+        assert_eq!(extension_for("application/pdf"), "pdf");
+        assert_eq!(extension_for("image/png"), "png");
+        assert_eq!(extension_for("image/jpeg"), "jpg");
+        assert_eq!(extension_for("application/octet-stream"), "bin");
+    }
+
+    #[test]
+    fn a_name_already_used_this_run_gets_a_counter() {
+        let mut used = HashSet::new();
+        used.insert("配布.pdf".to_string());
+        let dir = std::env::temp_dir().join("metamoji-download-test-nonexistent");
+        assert_eq!(unique_filename(&used, &dir, "配布", "pdf"), "配布 (2).pdf");
+    }
+
+    #[test]
+    fn a_note_in_the_chosen_folder_itself_lands_directly_in_dest_dir() {
+        assert_eq!(
+            sub_directory("/tmp/out", "/算数/", "/算数/"),
+            PathBuf::from("/tmp/out")
+        );
+    }
+
+    #[test]
+    fn a_note_in_a_subfolder_is_mirrored_under_dest_dir() {
+        assert_eq!(
+            sub_directory("/tmp/out", "/算数/", "/算数/4月/"),
+            PathBuf::from("/tmp/out/4月")
+        );
+    }
+
+    #[test]
+    fn downloading_from_the_root_mirrors_the_whole_tree() {
+        assert_eq!(
+            sub_directory("/tmp/out", "/", "/算数/4月/"),
+            PathBuf::from("/tmp/out/算数/4月")
+        );
+    }
 }

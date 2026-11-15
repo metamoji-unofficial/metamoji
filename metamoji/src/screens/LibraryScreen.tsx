@@ -309,6 +309,52 @@ export function LibraryScreen() {
     );
   };
 
+  /**
+   * Downloads every note's background under a class-box folder — PDFs and
+   * images, no handwriting — into a folder the user picks.
+   *
+   * Shares `busy`/`error` with the rest of the screen rather than its own
+   * progress UI: the download can take a while, and this is the banner the
+   * user is already watching during an import.
+   */
+  const downloadClassboxFolder = async (path: string) => {
+    if (view.kind !== "classbox") return;
+    const dir = await open({ directory: true, multiple: false });
+    if (typeof dir !== "string") return;
+
+    setError(null);
+    setBusy(t("ダウンロードしています…"));
+    const unlisten = await api.onClassboxDownloadProgress((p) => {
+      setBusy(
+        p.title
+          ? t("ダウンロードしています… {done} / {total}({title})", {
+              done: p.done,
+              total: p.total,
+              title: p.title,
+            })
+          : t("ダウンロードしています… {done} / {total}", { done: p.done, total: p.total }),
+      );
+    });
+    try {
+      const result = await api.classboxDownloadFolder(view.id, path, dir);
+      window.alert(
+        t("{saved} 件を保存しました(背景なし: {skipped} 件、失敗: {failed} 件)", {
+          saved: result.saved.length,
+          skipped: result.skipped.length,
+          failed: result.failed.length,
+        }),
+      );
+      if (result.failed.length > 0) {
+        setError(result.failed.map((f) => `${f.title ?? f.documentId}: ${f.error}`).join("\n"));
+      }
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      unlisten();
+      setBusy(null);
+    }
+  };
+
   const openClassNote = async (documentId: string, title: string | null) => {
     if (view.kind !== "classbox") return;
     setError(null);
@@ -723,6 +769,7 @@ export function LibraryScreen() {
               onNavigate={(next) => useClassroomStore.getState().setBoxPath(next)}
               onRetry={() => void useClassroomStore.getState().openBox()}
               onOpen={(id, title) => void openClassNote(id, title)}
+              onDownload={(path) => void downloadClassboxFolder(path)}
             />
           ) : loading ? (
             <div className="library__empty">{t("読み込み中…")}</div>
@@ -995,6 +1042,7 @@ function ClassBoxGrid({
   onNavigate,
   onRetry,
   onOpen,
+  onDownload,
 }: {
   listing: ClassBoxListing | null;
   loading: boolean;
@@ -1003,6 +1051,8 @@ function ClassBoxGrid({
   onNavigate: (path: string) => void;
   onRetry: () => void;
   onOpen: (documentId: string, title: string | null) => void;
+  /** Downloads every note's background under `path`, subfolders included. */
+  onDownload: (path: string) => void;
 }) {
   const { t } = useTranslation();
 
@@ -1062,7 +1112,15 @@ function ClassBoxGrid({
 
   return (
     <>
-      {crumbs.length > 0 && <Breadcrumbs crumbs={crumbs} onNavigate={onNavigate} />}
+      <div className="box-toolbar">
+        {crumbs.length > 0 && <Breadcrumbs crumbs={crumbs} onNavigate={onNavigate} />}
+        <div className="library__actions">
+          <button type="button" className="btn btn--text" onClick={() => onDownload(path)}>
+            <Icon name="download" size={18} />
+            {t("このフォルダ内をすべてダウンロード")}
+          </button>
+        </div>
+      </div>
 
       {/*
        * Two grids, not one. A folder card is a single row of text and a note
