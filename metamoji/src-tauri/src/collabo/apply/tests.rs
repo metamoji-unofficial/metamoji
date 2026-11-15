@@ -574,6 +574,173 @@ fn the_erasers_own_direction_takes_the_stroke_out() {
 }
 
 #[test]
+fn two_strokes_on_one_layer_each_get_their_own_unit() {
+    // Not one shared `$draw` the old code bundled every stroke on a layer
+    // into: that made a stroke impossible to select or move on its own, and
+    // mismatches the one-unit-per-stroke shape the editor's own pen tool
+    // writes.
+    let mut tree = note();
+    for element_id in ["el-1", "el-2"] {
+        let add = decode(&wire("booth_[unit]_draw", |tree| {
+            tree.insert(detached(model(
+                "d",
+                Some("direction"),
+                "D",
+                json!({ "T": 0 }),
+            )));
+            tree.insert(model(
+                "i0",
+                Some("d"),
+                "i",
+                json!({ "i": element_id, "m": { "$ref": "e" } }),
+            ));
+            tree.insert(detached(model(
+                "e",
+                Some("direction"),
+                "E",
+                json!({
+                    "I": element_id, "T": 1,
+                    "P": { "$points": [1.0, 2.0, 3.0, 4.0] },
+                    "BX": 1.0, "BY": 2.0, "BW": 2.0, "BH": 2.0,
+                }),
+            )));
+            json!({ "$ref": "d" })
+        }))
+        .unwrap();
+        apply(
+            &mut tree,
+            "P1_[layer-forUser]_9876",
+            &add,
+            &Default::default(),
+        );
+    }
+
+    let draws: Vec<&GenericModel> = tree
+        .models
+        .values()
+        .filter(|m| m.model_type == "$draw")
+        .collect();
+    assert_eq!(draws.len(), 2, "one unit per stroke, not one shared unit");
+    for draw in &draws {
+        assert_eq!(draw.props["strokes"].as_array().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn replaying_the_same_stroke_rewrites_its_unit_rather_than_duplicating_it() {
+    let mut tree = note();
+    let add = decode(&wire("booth_[unit]_draw", |tree| {
+        tree.insert(detached(model(
+            "d",
+            Some("direction"),
+            "D",
+            json!({ "T": 0 }),
+        )));
+        tree.insert(model(
+            "i0",
+            Some("d"),
+            "i",
+            json!({ "i": "el-1", "m": { "$ref": "e" } }),
+        ));
+        tree.insert(detached(model(
+            "e",
+            Some("direction"),
+            "E",
+            json!({ "I": "el-1", "T": 1, "P": { "$points": [1.0, 2.0, 3.0, 4.0] },
+                    "BX": 1.0, "BY": 2.0, "BW": 2.0, "BH": 2.0 }),
+        )));
+        json!({ "$ref": "d" })
+    }))
+    .unwrap();
+    apply(
+        &mut tree,
+        "P1_[layer-forUser]_9876",
+        &add,
+        &Default::default(),
+    );
+    let after_one = tree
+        .models
+        .values()
+        .filter(|m| m.model_type == "$draw")
+        .count();
+    apply(
+        &mut tree,
+        "P1_[layer-forUser]_9876",
+        &add,
+        &Default::default(),
+    );
+    let after_two = tree
+        .models
+        .values()
+        .filter(|m| m.model_type == "$draw")
+        .count();
+    assert_eq!(after_one, after_two);
+}
+
+#[test]
+fn a_unit_with_no_unit_id_of_its_own_does_not_wipe_out_every_other_unit() {
+    // A unit whose model carries no `unitId` property used to fall back to an
+    // empty string; `place_unit` keyed its "replace the previous copy" cleanup
+    // on a prefix built from that id, and an empty id made the prefix match
+    // *every* unit ever placed under this root rather than just this one.
+    let mut tree = note();
+    let first = decode(&add_unit_payload("$text", "u-1")).unwrap();
+    apply(
+        &mut tree,
+        "P1_[layer-forUser]_9876",
+        &first,
+        &Default::default(),
+    );
+    assert!(
+        tree.models.values().any(|m| m.model_type == "$text"),
+        "the first unit landed"
+    );
+
+    // A unit model with neither a `unitId` prop nor an element `I` to fall
+    // back on — the degenerate case the guard protects against.
+    let second = decode(&wire("booth_[unit]_draw", |tree| {
+        tree.insert(detached(model(
+            "d",
+            Some("direction"),
+            "D",
+            json!({ "T": 0, "V": 2 }),
+        )));
+        tree.insert(model(
+            "i0",
+            Some("d"),
+            "i",
+            json!({ "i": "e2", "m": { "$ref": "e" } }),
+        ));
+        tree.insert(detached(model(
+            "e",
+            Some("direction"),
+            "E",
+            json!({ "T": 2, "u": { "$ref": "u" } }),
+        )));
+        tree.insert(detached(model(
+            "u",
+            Some("direction"),
+            "$image",
+            json!({ "x": 1.0, "y": 1.0, "width": 2.0, "height": 2.0 }),
+        )));
+        json!({ "$ref": "d" })
+    }))
+    .unwrap();
+    apply(
+        &mut tree,
+        "P1_[layer-forUser]_9876",
+        &second,
+        &Default::default(),
+    );
+
+    assert!(
+        tree.models.values().any(|m| m.model_type == "$text"),
+        "the first unit must survive an unrelated unit with no id of its own"
+    );
+    assert!(tree.models.values().any(|m| m.model_type == "$image"));
+}
+
+#[test]
 fn a_fragment_named_by_the_eraser_goes_too() {
     // A record for a piece the engine split off names the stroke it came from
     // in `b`; both ids refer to ink that is no longer whole.

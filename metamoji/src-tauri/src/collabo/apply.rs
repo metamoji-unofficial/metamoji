@@ -277,20 +277,25 @@ fn drawing_changes(doc: &ParsedDocument, index: usize) -> Vec<Change> {
         let Some(unit_model) = doc.models.get(&(unit as usize)) else {
             continue;
         };
+        // The element's own id, used below both as the `$roomElementId` hint
+        // and — when the unit itself carries no `unitId` — as the identity
+        // `place_unit` keys this unit's replacement by. Without it a unit
+        // that has no `unitId` of its own (not every unit does) would fall
+        // back to an empty string, and an empty `unit_id` makes `place_unit`'s
+        // "replace the previous copy of this unit" cleanup match *every*
+        // unit ever placed under this root instead of just this one.
+        let element_id = doc.models[&(element as usize)]
+            .props
+            .get("I")
+            .and_then(Value::as_str);
         let mut models = subtree(doc, unit as usize);
         if let Some(root) = models.first_mut() {
-            if let Value::Object(props) = &mut root.props {
-                if let Some(id) = doc.models[&(element as usize)]
-                    .props
-                    .get("I")
-                    .and_then(Value::as_str)
-                {
-                    props.insert(ELEMENT_ID_KEY.into(), Value::String(id.to_string()));
-                }
+            if let (Value::Object(props), Some(id)) = (&mut root.props, element_id) {
+                props.insert(ELEMENT_ID_KEY.into(), Value::String(id.to_string()));
             }
         }
         out.push(Change::Unit {
-            unit_id: unit_id_of(unit_model, ""),
+            unit_id: unit_id_of(unit_model, element_id.unwrap_or_default()),
             models,
         });
     }
@@ -564,7 +569,10 @@ pub fn apply(
             } => applied
                 .assets
                 .push((ticket.clone(), mime.clone(), bytes.clone())),
-            Change::Unsupported { kind } => applied.unsupported.push(kind.clone()),
+            Change::Unsupported { kind } => {
+                log::warn!("{booth_id}: 未対応の payload を破棄しました ({kind})");
+                applied.unsupported.push(kind.clone());
+            }
             Change::Unit { unit_id, models } => {
                 if place_unit(tree, &place, unit_id, models) {
                     applied.units += 1;
@@ -625,12 +633,21 @@ fn place_unit(
     // Anything left from a previous copy of this unit goes first, so an update
     // does not leave orphaned sub-models behind. A unit the document itself
     // carried is replaced too — the update is about that unit.
-    let mut stale: Vec<String> = tree
-        .models
-        .keys()
-        .filter(|id| id.starts_with(&prefix))
-        .cloned()
-        .collect();
+    //
+    // Guarded against an empty `unit_id`: `sanitise("")` is itself empty, so
+    // an ungated prefix match would degrade to `"{root}_r_"` and catch every
+    // unit this function has ever placed under this root, replacing all of
+    // them instead of just this one — wiping a note down to whatever the one
+    // unsupported direction carried.
+    let mut stale: Vec<String> = if unit_id.is_empty() {
+        Vec::new()
+    } else {
+        tree.models
+            .keys()
+            .filter(|id| id.starts_with(&prefix))
+            .cloned()
+            .collect()
+    };
     stale.extend(find_unit(tree, unit_id));
     for id in &stale {
         detach(tree, id);
@@ -659,11 +676,14 @@ fn place_unit(
     true
 }
 
-/// Adds one stroke to the drawing unit of the booth's layer, creating that
-/// unit the first time.
+/// Adds one stroke as its own `$draw` unit, creating that unit the first time.
 ///
-/// Keyed by the stroke's own element id, so a replayed booth rewrites the same
-/// stroke instead of drawing it twice.
+/// One unit per stroke, not one shared unit per layer: this is the model the
+/// editor's own pen tool writes (`commitStroke` in `canvas/controller.ts`), and
+/// what selection and per-stroke move both expect — a stroke sharing a unit
+/// with others on its layer can only be selected or moved as part of whatever
+/// else landed there first. Keyed by the stroke's own element id, so a
+/// replayed booth rewrites the same unit instead of drawing it twice.
 fn place_stroke(tree: &mut GenericTree, place: &Placement, id: &str, stroke: &Value) -> bool {
     let Some(page_id) = find_by_prop(tree, "$page", "pageId", &place.page_id) else {
         return false;
@@ -672,28 +692,8 @@ fn place_stroke(tree: &mut GenericTree, place: &Placement, id: &str, stroke: &Va
         return false;
     };
 
-    let draw_id = format!("{}_ink_{}", tree.root_id, sanitise(&layer_id));
-    if !tree.models.contains_key(&draw_id) {
-        tree.insert(GenericModel {
-            id: draw_id.clone(),
-            parent_id: Some(layer_id),
-            model_type: "$draw".into(),
-            props: json!({ "strokes": [] }),
-            children: Vec::new(),
-        });
-    }
+    let draw_id = format!("{}_ink_{}", tree.root_id, sanitise(id));
 
-    let Some(draw) = tree.models.get_mut(&draw_id) else {
-        return false;
-    };
-    let Value::Object(props) = &mut draw.props else {
-        return false;
-    };
-    let mut strokes = match props.remove("strokes") {
-        Some(Value::Array(list)) => list,
-        _ => Vec::new(),
-    };
-    strokes.retain(|s| s.get("id").and_then(Value::as_str) != Some(id));
     let mut stroke = stroke.clone();
     if let Value::Object(map) = &mut stroke {
         // A hint for matching a later removal. The note's own record of what
@@ -705,18 +705,26 @@ fn place_stroke(tree: &mut GenericTree, place: &Placement, id: &str, stroke: &Va
             Value::String(id.to_string()),
         );
     }
-    strokes.push(stroke);
 
-    // The renderer culls by frame before it looks at a stroke, so the unit has
-    // to grow to hold what it now contains.
-    let frame = stroke_bounds(&strokes);
-    props.insert("strokes".into(), Value::Array(strokes));
-    if let Some((x, y, w, h)) = frame {
-        props.insert("x".into(), json!(x));
-        props.insert("y".into(), json!(y));
-        props.insert("width".into(), json!(w));
-        props.insert("height".into(), json!(h));
+    // The renderer culls by frame before it looks at a stroke, so the unit
+    // needs one of its own — just this one stroke's bounds, now that nothing
+    // else shares it.
+    let frame = stroke_bounds(std::slice::from_ref(&stroke));
+    let mut props = json!({ "unitId": draw_id, "strokes": [stroke] });
+    if let (Value::Object(map), Some((x, y, w, h))) = (&mut props, frame) {
+        map.insert("x".into(), json!(x));
+        map.insert("y".into(), json!(y));
+        map.insert("width".into(), json!(w));
+        map.insert("height".into(), json!(h));
     }
+
+    tree.insert(GenericModel {
+        id: draw_id,
+        parent_id: Some(layer_id),
+        model_type: "$draw".into(),
+        props,
+        children: Vec::new(),
+    });
     true
 }
 
