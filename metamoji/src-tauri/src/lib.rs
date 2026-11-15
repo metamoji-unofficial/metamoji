@@ -259,6 +259,7 @@ pub fn run() {
             commands::classbox_open,
             commands::classbox_revision,
             commands::classbox_open_note,
+            commands::classbox_download_folder,
             commands::classbox_send_strokes,
             commands::metamoji_fetch,
             commands::classbox_link,

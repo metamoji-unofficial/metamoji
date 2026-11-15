@@ -23,6 +23,12 @@ pub struct ImportedAsset {
     pub ticket: String,
     pub mime: String,
     pub bytes: Vec<u8>,
+    /// Whether this ticket is the document's own — the first blob on a model
+    /// the `attachments` map names, which is the PDF or image a page is drawn
+    /// on. `false` is everything else this format also embeds, chiefly page
+    /// thumbnails: real data, just not what "the background" means to a
+    /// caller that wants the handout and nothing this app or a room added.
+    pub named: bool,
 }
 
 const ATTACHMENTS_TYPE: &str = "attachments";
@@ -143,6 +149,7 @@ fn take_blob(
     // The document's own ticket for the first blob on an attachment model;
     // anything else gets one derived from where it was found, which is stable
     // across imports of the same file.
+    let is_named = named.is_some() && seen == 0;
     let ticket = match named {
         Some(ticket) if seen == 0 => ticket.clone(),
         _ if path.is_empty() => model_id.to_string(),
@@ -153,6 +160,7 @@ fn take_blob(
         ticket,
         mime,
         bytes,
+        named: is_named,
     })
 }
 
@@ -281,6 +289,9 @@ mod tests {
         assert_eq!(assets[0].ticket, "tkt-1");
         assert_eq!(assets[0].mime, "application/pdf");
         assert_eq!(assets[0].bytes, b"%PDF-");
+        // This is the one bit a caller that wants only the background (no
+        // thumbnails, no room writing) relies on to tell it apart.
+        assert!(assets[0].named);
         assert_eq!(
             tree.models["root_m6"].props["$blob"],
             json!({ "$asset": "tkt-1", "$mime": "application/pdf", "$size": 5 })
@@ -300,6 +311,9 @@ mod tests {
         assert_eq!(assets.len(), 1);
         assert_eq!(assets[0].ticket, "root_m9:v");
         assert_eq!(assets[0].mime, "image/png");
+        // A page thumbnail, not a background — not in the `attachments` map,
+        // so it never gets a document-given ticket.
+        assert!(!assets[0].named);
         assert_eq!(
             tree.models["root_m9"].props["v"]["$asset"],
             json!("root_m9:v")
