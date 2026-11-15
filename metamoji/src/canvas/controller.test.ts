@@ -13,13 +13,6 @@ import { A4_WIDTH, A4_HEIGHT, createDocument, createDrawUnit, createTextUnit } f
 import { strokeBounds } from "../model/stroke";
 import type { InkPoint, PenAttributes, Point, Rect, Unit } from "../model/types";
 
-import { beforeEach, describe, expect, it, vi } from "vitest";
-
-import { CanvasController, type ToolMode } from "./controller";
-import { EditSession } from "../editor/session";
-import { A4_WIDTH, A4_HEIGHT, createDocument, createDrawUnit, createTextUnit } from "../model/factory";
-import { strokeBounds } from "../model/stroke";
-
 /**
  * jsdom has no canvas backend, so the drawing calls need somewhere to go. The
  * controller's geometry — which is what these tests are about — does not care
