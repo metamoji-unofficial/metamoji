@@ -42,6 +42,7 @@ import {
   normalizeRect,
   resizeUnit,
   toUnitLocal,
+  unitRect,
   unitsInRect,
   type HandleType,
 } from "../render/hitTest";
@@ -703,6 +704,22 @@ export class CanvasController {
       }
     }
 
+    // A plain (non-additive) click inside an already-selected unit's frame
+    // continues dragging the current selection as-is, even where that unit
+    // paints nothing right there (an unfilled shape's interior, an empty text
+    // box). Once something is selected, its full frame is the grab handle —
+    // the same convention as the dashed selection outline in any 2D editor.
+    // `hitsUnit`/`hitTestUnit` stay strict about actual visible pixels; they
+    // are for picking a *new* target, which is what issue #2/#3 is about.
+    if (!additive && this.selection.length > 0 && this.pointInSelectionFrame(page, world)) {
+      this.gesture = {
+        ...base,
+        kind: "move",
+        originals: this.captureGeometry(page, this.selection),
+      };
+      return;
+    }
+
     const hit = hitTestUnit(page, world.x, world.y);
     if (hit) {
       const already = this.selection.includes(hit.unit.id);
@@ -732,6 +749,18 @@ export class CanvasController {
       kind: "marquee",
       marquee: { x: world.x, y: world.y, width: 0, height: 0 },
     };
+  }
+
+  /** Whether `world` falls inside the frame of any currently selected unit. */
+  private pointInSelectionFrame(page: Page, world: Point): boolean {
+    for (const layer of page.layers) {
+      for (const unit of layer.units) {
+        if (!this.selection.includes(unit.id)) continue;
+        const local = toUnitLocal(unit, world.x, world.y);
+        if (rectContainsPoint(unitRect(unit), local.x, local.y)) return true;
+      }
+    }
+    return false;
   }
 
   private captureGeometry(page: Page, ids: ModelId[]) {
