@@ -33,10 +33,46 @@ pub type Frame = (String, Vec<u8>);
 
 /// No traffic for this long means the replay is over.
 const QUIET: Duration = Duration::from_millis(1500);
-/// However busy the room, stop asking after this.
+/// However busy the room, stop asking after this — unless the room is still
+/// sending when it is reached, in which case the wait is extended (see
+/// `MAX_EXTENSIONS`).
 const LIMIT: Duration = Duration::from_secs(20);
+/// How many times `LIMIT` may be extended for a room that is still sending
+/// when the current window closes. The relay has no pagination or
+/// continuation token — `AttachBooth` either keeps talking or it does not —
+/// so the only way to tell a long history from a stuck one is whether
+/// anything is still arriving. Cutting a still-busy room off at a flat 20s
+/// is what left a reopened note with only part of what had been written
+/// (#9); bounding the extensions keeps a room that truly never goes quiet
+/// from hanging the open forever.
+const MAX_EXTENSIONS: u32 = 4;
 /// Long enough for `LoginRoomResult` to come back before booths are asked for.
 const LOGIN_GRACE: Duration = Duration::from_millis(1200);
+
+/// Whether a pull should keep waiting for more of a room's history.
+///
+/// `QUIET` ends it unconditionally — nothing is coming. Short of that, the
+/// first `LIMIT` always finishes the wait undisturbed; past it, a room still
+/// sending (traffic arrived since `quiet_elapsed` was last reset) earns
+/// another `LIMIT`, up to `extensions_used` reaching `MAX_EXTENSIONS`.
+fn should_keep_waiting(
+    quiet_elapsed: Duration,
+    total_elapsed: Duration,
+    extensions_used: &mut u32,
+) -> bool {
+    if quiet_elapsed >= QUIET {
+        return false;
+    }
+    if total_elapsed < LIMIT + LIMIT * (*extensions_used) {
+        return true;
+    }
+    if *extensions_used < MAX_EXTENSIONS {
+        *extensions_used += 1;
+        true
+    } else {
+        false
+    }
+}
 
 /// What a pull found, for the user rather than for the log.
 #[derive(Debug, Default, Clone, Serialize)]
@@ -321,6 +357,7 @@ pub async fn fetch(
     let started = std::time::Instant::now();
     let mut last_count = 0usize;
     let mut quiet_since = std::time::Instant::now();
+    let mut extensions_used = 0u32;
     loop {
         tokio::time::sleep(Duration::from_millis(200)).await;
         let count = received.lock().unwrap().len();
@@ -328,7 +365,11 @@ pub async fn fetch(
             last_count = count;
             quiet_since = std::time::Instant::now();
         }
-        if quiet_since.elapsed() >= QUIET || started.elapsed() >= LIMIT {
+        if !should_keep_waiting(
+            quiet_since.elapsed(),
+            started.elapsed(),
+            &mut extensions_used,
+        ) {
             break;
         }
     }
@@ -423,6 +464,10 @@ fn fold(
 
     for (booth_id, _sequence, payload) in directions {
         let Ok(direction) = apply::decode(&payload) else {
+            log::warn!(
+                "{booth_id}: Direction を読み取れませんでした ({} bytes)",
+                payload.len()
+            );
             *unsupported
                 .entry("読み取れない Direction".into())
                 .or_default() += 1;
@@ -442,6 +487,7 @@ fn fold(
         pull.stroke_ids.extend(stroke_ids);
         assets.extend(found);
         for kind in kinds {
+            log::warn!("{booth_id}: 未対応の payload を破棄しました ({kind})");
             *unsupported.entry(kind).or_default() += 1;
         }
     }
@@ -452,6 +498,57 @@ fn fold(
         .map(|(kind, count)| format!("{kind} x{count}"))
         .collect();
     (pull, assets)
+}
+
+#[cfg(test)]
+mod waiting_tests {
+    use super::*;
+
+    #[test]
+    fn quiet_ends_it_no_matter_how_much_time_is_left() {
+        let mut extensions = 0;
+        assert!(!should_keep_waiting(
+            QUIET,
+            Duration::from_secs(1),
+            &mut extensions
+        ));
+        assert_eq!(extensions, 0);
+    }
+
+    #[test]
+    fn well_within_the_first_window_just_keeps_waiting() {
+        let mut extensions = 0;
+        assert!(should_keep_waiting(
+            Duration::from_millis(200),
+            Duration::from_secs(5),
+            &mut extensions
+        ));
+        assert_eq!(extensions, 0, "no extension spent while still inside LIMIT");
+    }
+
+    #[test]
+    fn a_room_still_sending_when_the_limit_is_reached_earns_more_time() {
+        let mut extensions = 0;
+        for expected in 1..=MAX_EXTENSIONS {
+            assert!(should_keep_waiting(
+                Duration::from_millis(0),
+                LIMIT + LIMIT * (expected - 1),
+                &mut extensions
+            ));
+            assert_eq!(extensions, expected, "one extension spent per busy window");
+        }
+    }
+
+    #[test]
+    fn extensions_run_out_eventually_so_a_never_quiet_room_cannot_hang_forever() {
+        let mut extensions = MAX_EXTENSIONS;
+        assert!(!should_keep_waiting(
+            Duration::from_millis(0),
+            LIMIT + LIMIT * MAX_EXTENSIONS,
+            &mut extensions
+        ));
+        assert_eq!(extensions, MAX_EXTENSIONS, "no extension left to spend");
+    }
 }
 
 #[cfg(test)]
