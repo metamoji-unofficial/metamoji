@@ -203,7 +203,7 @@ export function distanceToStroke(stroke: Stroke, x: number, y: number): number {
   return best;
 }
 
-function distanceToSegment(
+export function distanceToSegment(
   px: number, py: number,
   ax: number, ay: number,
   bx: number, by: number,

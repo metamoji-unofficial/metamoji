@@ -8,7 +8,7 @@
  * for space around small units.
  */
 
-import { distanceToStroke, rectContainsPoint } from "../model/stroke";
+import { distanceToSegment, distanceToStroke, rectContainsPoint } from "../model/stroke";
 import type { Layer, Page, Point, Rect, Unit } from "../model/types";
 
 export type HandleType =
@@ -60,6 +60,13 @@ export function hitTestUnit(page: Page, x: number, y: number): { layer: Layer; u
 
 const INK_HIT_SLOP = 6;
 
+/**
+ * Tolerance for grabbing a thin outline (a shape's stroke, a form's grid
+ * lines) — the same idea as `INK_HIT_SLOP`, applied to vector edges instead
+ * of ink centrelines.
+ */
+const OUTLINE_HIT_SLOP = 6;
+
 export function hitsUnit(unit: Unit, x: number, y: number): boolean {
   const local = toUnitLocal(unit, x, y);
 
@@ -78,7 +85,157 @@ export function hitsUnit(unit: Unit, x: number, y: number): boolean {
   // A background image is scenery, not a target.
   if (unit.type === "$bgimage") return false;
 
-  return rectContainsPoint(unitRect(unit), local.x, local.y);
+  // The remaining unit kinds can leave real, visible gaps inside their frame
+  // — an unfilled shape, a text box nobody has typed into yet, a grid with no
+  // fill colour. `createShapeUnit`/`createFormUnit`/`createTextUnit` all
+  // default to exactly that transparent state, so treating the whole frame as
+  // solid is not a corner case: it is what every freshly placed shape or text
+  // box looks like. Hit-testing the frame rect there lets an invisible corner
+  // of the object steal clicks (and selection) from whatever is genuinely
+  // visible underneath it — see issue #2/#3.
+  switch (unit.type) {
+    case "$shape":
+      return hitsShape(unit, local.x, local.y);
+    case "$text":
+      return hitsText(unit, local.x, local.y);
+    case "$form":
+      return hitsForm(unit, local.x, local.y);
+    default:
+      return rectContainsPoint(unitRect(unit), local.x, local.y);
+  }
+}
+
+function hitsText(unit: Extract<Unit, { type: "$text" }>, x: number, y: number): boolean {
+  const rect = unitRect(unit);
+  if (unit.backgroundColor || unit.borderColor) return rectContainsPoint(rect, x, y);
+  // No fill and no border: the frame itself paints nothing. An empty text box
+  // in that state is completely invisible and must not shadow anything.
+  if (unit.text.trim() === "") return false;
+  return rectContainsPoint(rect, x, y);
+}
+
+function hitsForm(unit: Extract<Unit, { type: "$form" }>, x: number, y: number): boolean {
+  const { x: ux, y: uy, width: w, height: h } = unit;
+  if (unit.backgroundColor) return rectContainsPoint(unitRect(unit), x, y);
+  if (unit.lineWidth <= 0) return false;
+
+  const rows = Math.max(1, unit.rows);
+  const cols = Math.max(1, unit.columns);
+  const segs: number[][] = [];
+  for (let r = 1; r < rows; r++) {
+    const ly = uy + (h / rows) * r;
+    segs.push([ux, ly, ux + w, ly]);
+  }
+  if (unit.form !== "ruled") {
+    for (let c = 1; c < cols; c++) {
+      const lx = ux + (w / cols) * c;
+      segs.push([lx, uy, lx, uy + h]);
+    }
+  }
+  if (unit.form === "table") {
+    segs.push(
+      [ux, uy, ux + w, uy],
+      [ux + w, uy, ux + w, uy + h],
+      [ux + w, uy + h, ux, uy + h],
+      [ux, uy + h, ux, uy],
+    );
+  }
+
+  const tol = unit.lineWidth / 2 + OUTLINE_HIT_SLOP;
+  return segs.some(([ax, ay, bx, by]) => distanceToSegment(x, y, ax, ay, bx, by) <= tol);
+}
+
+function hitsShape(unit: Extract<Unit, { type: "$shape" }>, x: number, y: number): boolean {
+  const { x: ux, y: uy, width: w, height: h, strokeWidth } = unit;
+  const tol = strokeWidth / 2 + OUTLINE_HIT_SLOP;
+
+  // Open shapes have no interior at all — the frame bounding a diagonal line
+  // is mostly empty space, so only the drawn segments themselves count.
+  if (unit.shape === "line" || unit.shape === "arrow") {
+    if (strokeWidth <= 0) return false;
+    const segs: number[][] = [[ux, uy, ux + w, uy + h]];
+    if (unit.shape === "arrow") {
+      const angle = Math.atan2(h, w);
+      const head = Math.max(8, strokeWidth * 4);
+      const tipX = ux + w;
+      const tipY = uy + h;
+      for (const spread of [Math.PI - 0.4, Math.PI + 0.4]) {
+        segs.push([
+          tipX, tipY,
+          tipX + head * Math.cos(angle + spread), tipY + head * Math.sin(angle + spread),
+        ]);
+      }
+    }
+    return segs.some(([ax, ay, bx, by]) => distanceToSegment(x, y, ax, ay, bx, by) <= tol);
+  }
+
+  const hasFill = unit.fillColor !== "";
+
+  if (unit.shape === "ellipse") {
+    const cx = ux + w / 2;
+    const cy = uy + h / 2;
+    const rx = Math.abs(w / 2);
+    const ry = Math.abs(h / 2);
+    if (rx <= 0 || ry <= 0) return false;
+    if (hasFill) {
+      const nx = (x - cx) / rx;
+      const ny = (y - cy) / ry;
+      return nx * nx + ny * ny <= 1;
+    }
+    if (strokeWidth <= 0) return false;
+    // Nearest point on the ellipse along the ray from its centre through the
+    // test point — a good approximation of true boundary distance for the
+    // mild eccentricities these shapes actually have.
+    const t = Math.atan2((y - cy) / ry, (x - cx) / rx);
+    const ex = cx + rx * Math.cos(t);
+    const ey = cy + ry * Math.sin(t);
+    return Math.hypot(x - ex, y - ey) <= tol;
+  }
+
+  // rect, roundRect, triangle, diamond: a closed polygon. The corner radius on
+  // roundRect is ignored here — close enough for hit-testing, and not worth a
+  // separate rounded-corner distance routine.
+  const pts: Point[] =
+    unit.shape === "triangle"
+      ? [{ x: ux + w / 2, y: uy }, { x: ux + w, y: uy + h }, { x: ux, y: uy + h }]
+      : unit.shape === "diamond"
+        ? [
+            { x: ux + w / 2, y: uy },
+            { x: ux + w, y: uy + h / 2 },
+            { x: ux + w / 2, y: uy + h },
+            { x: ux, y: uy + h / 2 },
+          ]
+        : [
+            { x: ux, y: uy },
+            { x: ux + w, y: uy },
+            { x: ux + w, y: uy + h },
+            { x: ux, y: uy + h },
+          ];
+
+  if (hasFill) return pointInPolygon(pts, x, y);
+  if (strokeWidth <= 0) return false;
+  return polygonEdges(pts).some(([ax, ay, bx, by]) => distanceToSegment(x, y, ax, ay, bx, by) <= tol);
+}
+
+function polygonEdges(pts: Point[]): number[][] {
+  const segs: number[][] = [];
+  for (let i = 0; i < pts.length; i++) {
+    const a = pts[i];
+    const b = pts[(i + 1) % pts.length];
+    segs.push([a.x, a.y, b.x, b.y]);
+  }
+  return segs;
+}
+
+function pointInPolygon(pts: Point[], x: number, y: number): boolean {
+  let inside = false;
+  for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+    const { x: xi, y: yi } = pts[i];
+    const { x: xj, y: yj } = pts[j];
+    const intersect = yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi;
+    if (intersect) inside = !inside;
+  }
+  return inside;
 }
 
 /** Handle positions in world space, in the unit's un-rotated frame. */
