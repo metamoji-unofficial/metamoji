@@ -5,28 +5,57 @@ import type { StrokeShape } from "./stroke";
 import { screenToWorld, worldToScreen, zoomAbout, clampScale, fitRect } from "../render/viewport";
 import type { InkPoint, PenAttributes, Stroke } from "./types";
 
-/** Point-in-union test mirroring what a nonzero-rule Canvas fill computes. */
+/**
+ * True nonzero-winding point test, mirroring what Canvas's `fill()` actually
+ * computes for the Path2D that `buildStrokePath` builds from these shapes.
+ *
+ * This is deliberately *not* "is the point inside any shape" (a plain union
+ * test): the nonzero rule sums signed crossings across every subpath, so two
+ * overlapping shapes that wind in opposite directions cancel out to zero —
+ * i.e. a hole — even though each one individually contains the point. A
+ * union-only test can't see that; this one can.
+ */
 function isCovered(shapes: StrokeShape[], x: number, y: number): boolean {
-  return shapes.some((shape) => {
-    if (shape.kind === "circle") return Math.hypot(x - shape.cx, y - shape.cy) <= shape.r;
-    const [a, b, c, d] = shape.pts;
-    return pointInQuad(x, y, a, b, c, d);
-  });
+  return windingNumber(shapes, x, y) !== 0;
 }
 
-function pointInQuad(
-  x: number, y: number,
-  a: { x: number; y: number }, b: { x: number; y: number },
-  c: { x: number; y: number }, d: { x: number; y: number },
-): boolean {
-  const cross = (p: typeof a, q: typeof a) => (q.x - p.x) * (y - p.y) - (q.y - p.y) * (x - p.x);
-  const s1 = Math.sign(cross(a, b));
-  const s2 = Math.sign(cross(b, c));
-  const s3 = Math.sign(cross(c, d));
-  const s4 = Math.sign(cross(d, a));
-  const allNonNeg = s1 >= 0 && s2 >= 0 && s3 >= 0 && s4 >= 0;
-  const allNonPos = s1 <= 0 && s2 <= 0 && s3 <= 0 && s4 <= 0;
-  return allNonNeg || allNonPos;
+function windingNumber(shapes: StrokeShape[], x: number, y: number): number {
+  let winding = 0;
+  for (const shape of shapes) {
+    const poly = shape.kind === "circle" ? circlePolygon(shape) : shape.pts;
+    winding += polygonWinding(poly, x, y);
+  }
+  return winding;
+}
+
+/**
+ * Polygonal stand-in for a circle shape, sampled in the same direction
+ * `buildStrokePath` draws it: `moveTo(cx + r, cy)` (angle 0) then
+ * `arc(cx, cy, r, 0, 2*PI)` (increasing angle).
+ */
+function circlePolygon(c: { cx: number; cy: number; r: number }, segments = 64) {
+  const pts: { x: number; y: number }[] = [];
+  for (let i = 0; i < segments; i++) {
+    const t = (i / segments) * Math.PI * 2;
+    pts.push({ x: c.cx + c.r * Math.cos(t), y: c.cy + c.r * Math.sin(t) });
+  }
+  return pts;
+}
+
+/** Signed edge-crossing winding number of a closed polygon around (x, y). */
+function polygonWinding(poly: { x: number; y: number }[], x: number, y: number): number {
+  let winding = 0;
+  for (let i = 0; i < poly.length; i++) {
+    const p0 = poly[i];
+    const p1 = poly[(i + 1) % poly.length];
+    const isLeft = (p1.x - p0.x) * (y - p0.y) - (x - p0.x) * (p1.y - p0.y);
+    if (p0.y <= y) {
+      if (p1.y > y && isLeft > 0) winding += 1;
+    } else {
+      if (p1.y <= y && isLeft < 0) winding -= 1;
+    }
+  }
+  return winding;
 }
 
 const pen: PenAttributes = {
@@ -108,6 +137,28 @@ describe("stroke geometry", () => {
 
   it("distance to an empty stroke is infinite rather than NaN", () => {
     expect(distanceToStroke(stroke([]), 0, 0)).toBe(Infinity);
+  });
+
+  it("a circle dab and its bridging quad wind the same way, so they merge instead of cancelling", () => {
+    // Regression test for issue #1: a straight two-point stroke has no
+    // self-intersection at all, yet if the quad's winding direction ever
+    // disagrees with the circle's, the half of each circle that overlaps its
+    // neighbouring quad nets to zero under the nonzero fill rule — a hole
+    // punched right through the middle of an ordinary stroke, and (where a
+    // real loop crosses itself) the crossing reads as comparatively more
+    // "solid" than the holed-out straight runs around it, i.e. the darker
+    // overlap the issue describes.
+    const points: InkPoint[] = [
+      { x: 0, y: 0, p: 0.5, t: 0 },
+      { x: 20, y: 0, p: 0.5, t: 1 },
+    ];
+    const shapes = strokeOutlineShapes(stroke(points));
+    // Just off-centre from the first dab, on the side the bridging quad
+    // covers — squarely inside both the circle and the quad.
+    expect(isCovered(shapes, 0.8, 0.8)).toBe(true);
+    expect(isCovered(shapes, 0.8, -0.8)).toBe(true);
+    // And well inside the bridge, away from either circle.
+    expect(isCovered(shapes, 10, 0)).toBe(true);
   });
 
   it("fills solid when the pen loops back over itself tighter than its own width", () => {

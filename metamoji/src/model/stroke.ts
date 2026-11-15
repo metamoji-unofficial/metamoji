@@ -84,7 +84,14 @@ export interface StrokeCircle {
   r: number;
 }
 
-/** The quad bridging two consecutive dabs, tangent to both. */
+/**
+ * The quad bridging two consecutive dabs, tangent to both.
+ *
+ * `pts` must wind the same direction as `StrokeCircle`'s arc (see
+ * `buildStrokePath`) — otherwise a circle and its bridging quad cancel each
+ * other out under the nonzero fill rule instead of merging, carving a hole
+ * wherever they overlap. See stroke.test.ts's winding-direction test.
+ */
 export interface StrokeQuad {
   kind: "quad";
   pts: [
@@ -125,13 +132,19 @@ export function strokeOutlineShapes(stroke: Stroke): StrokeShape[] {
     const py = dx;
     const ra = widthAt(stroke.pen, a.p) / 2;
     const rb = widthAt(stroke.pen, b.p) / 2;
+    // Wound to match the circles' arc direction (see the `arc` call in
+    // `buildStrokePath`): start on one side of `a`, cross to the same side of
+    // `b`, cross back. Walking "+side of a, +side of b, -side of b, -side of
+    // a" instead — i.e. down one side and back up the other — produces the
+    // opposite winding from the circles, so it cancels them under the nonzero
+    // fill rule instead of merging with them.
     shapes.push({
       kind: "quad",
       pts: [
         { x: a.x + px * ra, y: a.y + py * ra },
-        { x: b.x + px * rb, y: b.y + py * rb },
-        { x: b.x - px * rb, y: b.y - py * rb },
         { x: a.x - px * ra, y: a.y - py * ra },
+        { x: b.x - px * rb, y: b.y - py * rb },
+        { x: b.x + px * rb, y: b.y + py * rb },
       ],
     });
   }
