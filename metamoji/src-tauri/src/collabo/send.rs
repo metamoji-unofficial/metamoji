@@ -1,4 +1,4 @@
-//! Building the Direction that adds one stroke.
+//! Building the Direction that adds one stroke, or places a unit.
 //!
 //! The mirror of `apply.rs`: where that reads what the room already holds,
 //! this produces what goes back. A stroke on the wire is four models —
@@ -480,6 +480,387 @@ fn all_stroke_ids(tree: &GenericTree) -> std::collections::HashSet<String> {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Units — $shape, $text, $form
+// ---------------------------------------------------------------------------
+//
+// A stroke is write-once: it is either on a layer or it has been erased, and
+// that is the whole lifecycle `Ledger` above tracks. A shape, text box or
+// form is not — it is moved, resized, retyped, recoloured — so telling the
+// room about it needs a third state `Ledger` has no room for: the unit is
+// still here, but what it holds has changed. `UnitLedger` carries a
+// fingerprint for exactly that; `unit_changes` is `changes`'s counterpart,
+// three buckets instead of two.
+//
+// Added: a `D`/`T=0` direction, the same one a stroke goes through
+// (`add_unit`) — confirmed by `apply.rs`'s own doc comment, which names
+// `$text`/`$image`/`$web`/ink alike as what an element's `u` can point at.
+// Changed: no `D`, no element — the unit resends its whole model directly
+// (`update_unit`), the other half of what `apply.rs::decode` understands.
+// Removed: `remove_element`, unchanged — it already finds a unit by the
+// `$roomElementId` hint `apply.rs::drawing_changes` stamps on, not anything
+// stroke-specific.
+
+/// The unit types this build will post on a student's behalf. `$bgimage` is
+/// scenery, not a live collaboration target — `src/render/hitTest.ts` treats
+/// it the same way — and `$image`/`$web` are left for later: this change is
+/// scoped to the three kinds the issue was filed about.
+const UNIT_TYPES: &[&str] = &["$shape", "$text", "$form"];
+
+/// What the room has been told about one unit, keyed by the note's own id for
+/// it — which, unlike a stroke's, is the same id every device that has ever
+/// seen this unit agrees on (`converter.ts` sets a unit's `unitId` to its own
+/// model id on the way into this build's generic tree).
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnitLedger {
+    pub unit_id: String,
+    /// The id the room knows this unit's *placing element* by — present only
+    /// because a unit arrived (or was sent) through the `D`/`T=0` add path;
+    /// an update carries no element and so cannot mint one.
+    pub element_id: String,
+    pub layer_id: String,
+    /// A hash of the unit's own subtree, taken the last time this was sent or
+    /// received. Not cryptographic — it only has to change when the content
+    /// does.
+    pub fingerprint: String,
+}
+
+/// One unit waiting to go out: its own model and everything it references,
+/// root first — the same shape `apply.rs::Change::Unit` carries in reverse.
+#[derive(Debug, Clone)]
+pub struct PendingUnit {
+    pub unit_id: String,
+    pub layer_id: String,
+    pub models: Vec<GenericModel>,
+}
+
+/// A stable hash of a unit's whole subtree, so `unit_changes` can tell "still
+/// here, unedited" from "still here, but different" without re-sending on
+/// every call to find out.
+///
+/// `serde_json::Value`'s map is a `BTreeMap` in this build (the
+/// `preserve_order` feature is off), so two reads of the same row serialise
+/// identically; sorting the models by id first makes the hash independent of
+/// whatever order `unit_subtree` happened to discover them in.
+pub(crate) fn fingerprint(models: &[GenericModel]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut ordered: Vec<&GenericModel> = models.iter().collect();
+    ordered.sort_by(|a, b| a.id.cmp(&b.id));
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for model in ordered {
+        model.model_type.hash(&mut hasher);
+        serde_json::to_string(&model.props)
+            .unwrap_or_default()
+            .hash(&mut hasher);
+    }
+    format!("{:016x}", hasher.finish())
+}
+
+/// The unit at `root_id`, together with everything it references — the mirror
+/// image of `apply.rs::subtree`, read from a live tree instead of a decoded
+/// one. Same traversal, so the same invariant holds: a model's parent always
+/// appears earlier in the result, which is what lets `graft_unit` insert in
+/// one pass.
+fn unit_subtree(tree: &GenericTree, root_id: &str) -> Vec<GenericModel> {
+    let mut order = vec![root_id.to_string()];
+    let mut seen: std::collections::HashSet<String> = order.iter().cloned().collect();
+    let mut queue = vec![root_id.to_string()];
+
+    while let Some(current) = queue.pop() {
+        let Some(model) = tree.models.get(&current) else {
+            continue;
+        };
+        let mut next = model.children.clone();
+        collect_string_refs(&model.props, &mut next);
+        for target in next {
+            if tree.models.contains_key(&target) && seen.insert(target.clone()) {
+                order.push(target.clone());
+                queue.push(target);
+            }
+        }
+    }
+
+    order
+        .into_iter()
+        .filter_map(|id| tree.models.get(&id).cloned())
+        .collect()
+}
+
+fn collect_string_refs(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::String(id)) = map.get("$ref") {
+                out.push(id.clone());
+                return;
+            }
+            for v in map.values() {
+                collect_string_refs(v, out);
+            }
+        }
+        Value::Array(items) => {
+            for v in items {
+                collect_string_refs(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Every `$shape`/`$text`/`$form` directly on a personal layer, with the
+/// layer it is on. Direct children only, the same restriction `$draw`'s
+/// strokes have: a unit nested inside another one is that unit's content, not
+/// a booth-addressable thing of its own.
+fn personal_units(tree: &GenericTree) -> Vec<PendingUnit> {
+    let mut out = Vec::new();
+    for layer in tree.models.values() {
+        if layer.model_type != "$layer" {
+            continue;
+        }
+        if layer.props.get("layerType").and_then(Value::as_str) != Some("system:personal") {
+            continue;
+        }
+        let Some(layer_id) = layer.props.get("layerId").and_then(Value::as_str) else {
+            continue;
+        };
+
+        for child_id in &layer.children {
+            let Some(unit) = tree.models.get(child_id) else {
+                continue;
+            };
+            if !UNIT_TYPES.contains(&unit.model_type.as_str()) {
+                continue;
+            }
+            let Some(unit_id) = unit.props.get("unitId").and_then(Value::as_str) else {
+                // No id of its own, no way to tell it from the next one on the
+                // next save — the same reason an id-less stroke is skipped.
+                continue;
+            };
+            out.push(PendingUnit {
+                unit_id: unit_id.to_string(),
+                layer_id: layer_id.to_string(),
+                models: unit_subtree(tree, child_id),
+            });
+        }
+    }
+    out.sort_by(|a, b| a.unit_id.cmp(&b.unit_id));
+    out
+}
+
+/// What has changed about this note's units since the room was last told.
+///
+/// Three buckets where `changes` has two: a unit with no ledger row is new;
+/// one whose fingerprint no longer matches what was last sent has been
+/// edited in place; a ledger row with no unit behind it any more — on a layer
+/// the note still has — was erased. The fourth number is units that cannot be
+/// sent because their layer is not named the way the room names layers, the
+/// same situation `changes`'s third return guards.
+pub fn unit_changes(
+    tree: &GenericTree,
+    ledger: &[UnitLedger],
+) -> (Vec<PendingUnit>, Vec<PendingUnit>, Vec<UnitLedger>, usize) {
+    let all = personal_units(tree);
+    let stale = all
+        .iter()
+        .filter(|p| !p.layer_id.contains(BOOTH_MARK))
+        .count();
+    let here: Vec<&PendingUnit> = all
+        .iter()
+        .filter(|p| p.layer_id.contains(BOOTH_MARK))
+        .collect();
+
+    let known: std::collections::HashMap<&str, &UnitLedger> =
+        ledger.iter().map(|l| (l.unit_id.as_str(), l)).collect();
+
+    let mut added = Vec::new();
+    let mut changed = Vec::new();
+    for pending in &here {
+        match known.get(pending.unit_id.as_str()) {
+            None => added.push((*pending).clone()),
+            Some(entry) if entry.fingerprint != fingerprint(&pending.models) => {
+                changed.push((*pending).clone());
+            }
+            Some(_) => {}
+        }
+    }
+
+    // A unit that moved to another layer (a teacher adopting a student's
+    // shape onto a shared one, say) has not been erased — look for it across
+    // the whole note, not just the personal layers, the same guard `changes`
+    // applies to strokes.
+    let alive = all_unit_ids(tree);
+    let layers = layer_ids(tree);
+    let removed: Vec<UnitLedger> = ledger
+        .iter()
+        .filter(|l| !alive.contains(l.unit_id.as_str()))
+        // And only from a layer the note still has — the same reasoning
+        // `changes` applies: a half-loaded tree must not read as "the student
+        // erased everything on it".
+        .filter(|l| layers.contains(&l.layer_id))
+        .cloned()
+        .collect();
+
+    (added, changed, removed, stale)
+}
+
+fn all_unit_ids(tree: &GenericTree) -> std::collections::HashSet<&str> {
+    tree.models
+        .values()
+        .filter(|m| UNIT_TYPES.contains(&m.model_type.as_str()))
+        .filter_map(|m| m.props.get("unitId").and_then(Value::as_str))
+        .collect()
+}
+
+/// Builds the payload that adds a whole unit — `$shape`/`$text`/`$form` — to
+/// `layer_id`. The same `D`/`T=0` mechanism `add_stroke` uses, because the
+/// wire does not distinguish them: an element's `u` can point at any ordinary
+/// unit model, ink included (`apply.rs`'s own doc comment).
+///
+/// Unlike a stroke's element, this one carries neither a `T` (element type)
+/// nor bounds: this build has not captured what the native client writes
+/// there for a non-stroke element, and `apply.rs::decode` reads neither —
+/// only `u`'s presence tells it this element wraps a unit rather than being
+/// one. Confirming the real values needs a wire capture this build does not
+/// have.
+pub fn add_unit(
+    models: &[GenericModel],
+    layer_id: &str,
+    ids: &mut IdGenerator,
+    edit_status_id: Option<&str>,
+) -> AppResult<(Vec<u8>, String)> {
+    if models.is_empty() {
+        return Err(AppError::other("ユニットの本体がありません"));
+    }
+    let element_id = ids.next_id();
+    let collaboration_id = ids.next_id();
+
+    let mut tree = GenericTree::new("d", "D");
+    if let Value::Object(props) = &mut tree.models.get_mut("d").unwrap().props {
+        props.insert("T".into(), json!(DIRECTION_ADD_REMOVE));
+        props.insert("V".into(), json!(DIRECTION_VERSION));
+        props.insert("M".into(), json!(MODULE_VERSION));
+        props.insert("O".into(), json!(MODULE_ACCEPTABLE_VERSION));
+        props.insert("C".into(), json!(collaboration_id));
+    }
+
+    tree.insert(GenericModel {
+        id: "i0".into(),
+        parent_id: Some("d".into()),
+        model_type: "i".into(),
+        props: json!({ "i": element_id, "m": { "$ref": "e" }, "t": EXECUTION_ADD }),
+        children: Vec::new(),
+    });
+
+    let unit_root = graft_unit(&mut tree, models);
+
+    tree.insert(detached(GenericModel {
+        id: "e".into(),
+        parent_id: Some("d".into()),
+        model_type: "E".into(),
+        props: json!({ "I": element_id, "u": { "$ref": unit_root } }),
+        children: Vec::new(),
+    }));
+
+    let payload = direction::encode(
+        DirectionData::Model(tree),
+        &format!("{layer_id}_[unit]_draw"),
+        edit_status_id,
+        Default::default(),
+    )?;
+    Ok((payload, element_id))
+}
+
+/// Copies a unit's own subtree into `tree` under fresh ids, and returns the id
+/// its root landed under. The root goes in detached, parented by reference
+/// (the element's `u`) rather than by child link — the same as a stroke's
+/// element and pen style in `add_stroke`.
+fn graft_unit(tree: &mut GenericTree, models: &[GenericModel]) -> String {
+    let renamed: std::collections::HashMap<&str, String> = models
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (m.id.as_str(), format!("u{i}")))
+        .collect();
+    let rename = |id: &str| renamed.get(id).cloned().unwrap_or_else(|| id.to_string());
+
+    for (position, model) in models.iter().enumerate() {
+        let mut props = model.props.clone();
+        rewrite_string_refs(&mut props, &rename);
+        if position == 0 {
+            if let Value::Object(map) = &mut props {
+                crate::atdoc::mark_detached(map);
+            }
+        }
+        tree.insert(GenericModel {
+            id: rename(&model.id),
+            parent_id: if position == 0 {
+                Some("d".to_string())
+            } else {
+                model.parent_id.as_deref().map(&rename)
+            },
+            model_type: model.model_type.clone(),
+            props,
+            children: Vec::new(),
+        });
+    }
+    rename(&models[0].id)
+}
+
+fn rewrite_string_refs(value: &mut Value, rename: &impl Fn(&str) -> String) {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::String(id)) = map.get("$ref") {
+                let renamed = rename(id);
+                map.insert("$ref".into(), Value::String(renamed));
+                return;
+            }
+            for v in map.values_mut() {
+                rewrite_string_refs(v, rename);
+            }
+        }
+        Value::Array(items) => {
+            for v in items {
+                rewrite_string_refs(v, rename);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A direct whole-unit-model Direction: no `D`, no element, the unit resends
+/// itself. The other half of `apply.rs::decode`'s vocabulary — "a unit model
+/// directly … is how a text unit's geometry and content are re-sent as it is
+/// edited" (`apply.rs:10-12`) — and so the natural way to tell the room about
+/// an edit to a `$shape`/`$form` too, not only `$text`.
+///
+/// `target` names the layer the unit belongs to, the booth `apply.rs` expects
+/// — not the unit itself: `apply.rs::decode` only falls back to `target` for
+/// the unit id when the model carries no `unitId` of its own, and every unit
+/// this build sends does (`converter.ts` sets one on the way in).
+pub fn update_unit(
+    models: &[GenericModel],
+    layer_id: &str,
+    edit_status_id: Option<&str>,
+) -> AppResult<Vec<u8>> {
+    let Some(root) = models.first() else {
+        return Err(AppError::other("ユニットの本体がありません"));
+    };
+
+    let mut subtree = GenericTree {
+        root_id: root.id.clone(),
+        models: std::collections::HashMap::new(),
+    };
+    for model in models {
+        subtree.models.insert(model.id.clone(), model.clone());
+    }
+
+    direction::encode(
+        DirectionData::Model(subtree),
+        layer_id,
+        edit_status_id,
+        Default::default(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -873,5 +1254,268 @@ mod stale_tests {
         let (added, _, stale) = changes(&tree, &[]);
         assert!(added.is_empty());
         assert_eq!(stale, 1);
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use crate::model::GenericModel;
+
+    fn note_with_unit(unit_type: &str, unit_id: &str, layer_id: &str, props: Value) -> GenericTree {
+        let mut tree = GenericTree::new("root", "$sharenote");
+        tree.insert(GenericModel {
+            id: "page".into(),
+            parent_id: Some("root".into()),
+            model_type: "$page".into(),
+            props: json!({ "pageId": "P1" }),
+            children: Vec::new(),
+        });
+        tree.insert(GenericModel {
+            id: "layer".into(),
+            parent_id: Some("page".into()),
+            model_type: "$layer".into(),
+            props: json!({ "layerId": layer_id, "layerType": "system:personal" }),
+            children: Vec::new(),
+        });
+        let mut unit_props = props;
+        if let Value::Object(map) = &mut unit_props {
+            map.insert("unitId".into(), json!(unit_id));
+        }
+        tree.insert(GenericModel {
+            id: "unit".into(),
+            parent_id: Some("layer".into()),
+            model_type: unit_type.into(),
+            props: unit_props,
+            children: Vec::new(),
+        });
+        tree
+    }
+
+    fn ledger_entry(unit_id: &str, fingerprint_value: &str) -> UnitLedger {
+        UnitLedger {
+            unit_id: unit_id.into(),
+            element_id: format!("el {unit_id}"),
+            layer_id: "P1_[layer-forUser]_9".into(),
+            fingerprint: fingerprint_value.into(),
+        }
+    }
+
+    // -- personal_units / unit_changes ---------------------------------------
+
+    #[test]
+    fn a_unit_the_room_has_not_been_told_about_goes_out_as_new() {
+        let tree = note_with_unit(
+            "$text",
+            "u-1",
+            "P1_[layer-forUser]_9",
+            json!({ "x": 1.0, "width": 10.0 }),
+        );
+        let (added, changed, removed, stale) = unit_changes(&tree, &[]);
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].unit_id, "u-1");
+        assert_eq!(added[0].layer_id, "P1_[layer-forUser]_9");
+        assert!(changed.is_empty());
+        assert!(removed.is_empty());
+        assert_eq!(stale, 0);
+    }
+
+    #[test]
+    fn a_unit_whose_fingerprint_still_matches_is_left_alone() {
+        let tree = note_with_unit(
+            "$shape",
+            "u-1",
+            "P1_[layer-forUser]_9",
+            json!({ "x": 1.0, "width": 10.0 }),
+        );
+        let models = unit_subtree(&tree, "unit");
+        let known_good = fingerprint(&models);
+        let (added, changed, removed, _) = unit_changes(&tree, &[ledger_entry("u-1", &known_good)]);
+        assert!(added.is_empty(), "nothing new to send");
+        assert!(changed.is_empty(), "the content has not moved");
+        assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn a_unit_edited_since_the_last_send_goes_out_as_changed() {
+        let tree = note_with_unit(
+            "$shape",
+            "u-1",
+            "P1_[layer-forUser]_9",
+            json!({ "x": 50.0, "width": 10.0 }),
+        );
+        // The ledger's fingerprint is from before the edit, so it no longer
+        // matches what the tree holds now.
+        let (added, changed, removed, _) =
+            unit_changes(&tree, &[ledger_entry("u-1", "stale-fingerprint")]);
+        assert!(added.is_empty());
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].unit_id, "u-1");
+        assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn a_unit_no_longer_in_the_note_is_reported_as_erased() {
+        let tree = note_with_unit("$form", "u-1", "P1_[layer-forUser]_9", json!({ "x": 1.0 }));
+        let known_good = fingerprint(&unit_subtree(&tree, "unit"));
+        let (added, changed, removed, _) = unit_changes(
+            &tree,
+            &[
+                ledger_entry("u-1", &known_good),
+                ledger_entry("gone", "whatever"),
+            ],
+        );
+        assert!(added.is_empty());
+        assert!(changed.is_empty());
+        assert_eq!(removed, vec![ledger_entry("gone", "whatever")]);
+    }
+
+    #[test]
+    fn a_unit_moved_to_another_layer_has_not_been_erased() {
+        // Moved from the personal layer the ledger remembers it on to a
+        // shared one — gone from `personal_units`, but still in the note.
+        let mut tree = note_with_unit("$shape", "u-1", "P1_[layer-forUser]_9", json!({ "x": 1.0 }));
+        tree.models.get_mut("layer").unwrap().props["layerType"] = json!("system:edit");
+        let (_, _, removed, _) = unit_changes(&tree, &[ledger_entry("u-1", "whatever")]);
+        assert!(removed.is_empty(), "still in the note, just not there");
+
+        // Gone from the note entirely is a different matter.
+        tree.models.get_mut("unit").unwrap().model_type = "$dummy".into();
+        let (_, _, removed, _) = unit_changes(&tree, &[ledger_entry("u-1", "whatever")]);
+        assert_eq!(removed.len(), 1);
+    }
+
+    #[test]
+    fn a_unit_on_a_layer_this_app_named_itself_is_reported_rather_than_posted() {
+        let tree = note_with_unit(
+            "$text",
+            "u-1",
+            "note_abc_l___subId_v2__x___page__4__layer_forUser__9",
+            json!({}),
+        );
+        let (added, _, _, stale) = unit_changes(&tree, &[]);
+        assert!(added.is_empty());
+        assert_eq!(stale, 1);
+    }
+
+    // -- add_unit / update_unit round trips ----------------------------------
+
+    fn text_unit(unit_id: &str) -> Vec<GenericModel> {
+        vec![GenericModel {
+            id: "unit".into(),
+            parent_id: Some("layer".into()),
+            model_type: "$text".into(),
+            props: json!({ "unitId": unit_id, "x": 10.0, "y": 20.0, "width": 30.5 }),
+            children: Vec::new(),
+        }]
+    }
+
+    #[test]
+    fn an_added_unit_decodes_back_as_itself() {
+        // The proof that encoder and decoder agree: build with `add_unit`,
+        // read with the unmodified `apply.rs::decode`.
+        let (bytes, element_id) = add_unit(
+            &text_unit("u-9"),
+            "P1_[layer-forUser]_9",
+            &mut IdGenerator::new(3),
+            None,
+        )
+        .unwrap();
+        assert!(element_id.contains(' '));
+
+        let direction = super::super::apply::decode(&bytes).unwrap();
+        match direction.changes.as_slice() {
+            [super::super::apply::Change::Unit { unit_id, models }] => {
+                assert_eq!(unit_id, "u-9");
+                assert_eq!(models[0].model_type, "$text");
+                assert_eq!(models[0].props["unitId"], json!("u-9"));
+                assert_eq!(models[0].props["width"], json!(30.5));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_added_unit_applies_onto_its_layer() {
+        let mut tree = GenericTree::new("root", "$sharenote");
+        tree.insert(GenericModel {
+            id: "page".into(),
+            parent_id: Some("root".into()),
+            model_type: "$page".into(),
+            props: json!({ "pageId": "P1" }),
+            children: Vec::new(),
+        });
+
+        let (bytes, _) = add_unit(
+            &text_unit("u-9"),
+            "P1_[layer-forUser]_9",
+            &mut IdGenerator::new(3),
+            None,
+        )
+        .unwrap();
+        let direction = super::super::apply::decode(&bytes).unwrap();
+        let applied = super::super::apply::apply(
+            &mut tree,
+            "P1_[layer-forUser]_9",
+            &direction,
+            &Default::default(),
+        );
+        assert_eq!(applied.units, 1);
+        let placed = tree
+            .models
+            .values()
+            .find(|m| m.model_type == "$text")
+            .expect("the unit was placed");
+        assert_eq!(placed.props["unitId"], json!("u-9"));
+    }
+
+    #[test]
+    fn an_updated_unit_decodes_as_an_update_to_that_unit() {
+        let bytes = update_unit(&text_unit("u-9"), "P1_[layer-forUser]_9", None).unwrap();
+        let direction = super::super::apply::decode(&bytes).unwrap();
+        match direction.changes.as_slice() {
+            [super::super::apply::Change::Unit { unit_id, models }] => {
+                assert_eq!(unit_id, "u-9");
+                assert_eq!(models[0].props["width"], json!(30.5));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_unit_with_no_body_is_refused_rather_than_sent_empty() {
+        assert!(add_unit(&[], "L", &mut IdGenerator::new(1), None).is_err());
+        assert!(update_unit(&[], "L", None).is_err());
+    }
+
+    #[test]
+    fn the_same_subtree_fingerprints_the_same_regardless_of_discovery_order() {
+        let a = vec![
+            GenericModel {
+                id: "x".into(),
+                parent_id: None,
+                model_type: "$text".into(),
+                props: json!({ "unitId": "u-1" }),
+                children: Vec::new(),
+            },
+            GenericModel {
+                id: "y".into(),
+                parent_id: None,
+                model_type: "$text".into(),
+                props: json!({ "a": 1 }),
+                children: Vec::new(),
+            },
+        ];
+        let mut b = a.clone();
+        b.reverse();
+        assert_eq!(fingerprint(&a), fingerprint(&b));
+    }
+
+    #[test]
+    fn a_different_subtree_fingerprints_differently() {
+        let a = text_unit("u-1");
+        let mut b = text_unit("u-1");
+        b[0].props["width"] = json!(999.0);
+        assert_ne!(fingerprint(&a), fingerprint(&b));
     }
 }

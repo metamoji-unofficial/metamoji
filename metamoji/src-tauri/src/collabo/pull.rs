@@ -138,20 +138,29 @@ pub fn booths_for(tree: &GenericTree, user_id: &str) -> Vec<String> {
     out
 }
 
-/// Posts strokes into the room, one Direction each.
+/// Posts strokes and unit changes into the room, one Direction each.
 ///
 /// Joins, sends, leaves — the same shape as `fetch`, and for the same reason:
 /// a session that stays open belongs to the editor, not to a one-off write.
 /// Returns how many went out; the caller marks those as sent.
+#[allow(clippy::too_many_arguments)]
 pub async fn post_strokes(
     cloud: &CloudClient,
     classroom: &ClassroomState,
     room_id: &str,
     strokes: &[send::Pending],
     removals: &[send::Ledger],
-) -> AppResult<Posted> {
-    if strokes.is_empty() && removals.is_empty() {
-        return Ok(Posted::default());
+    unit_added: &[send::PendingUnit],
+    unit_changed: &[send::PendingUnit],
+    unit_removed: &[send::UnitLedger],
+) -> AppResult<(Posted, PostedUnits)> {
+    if strokes.is_empty()
+        && removals.is_empty()
+        && unit_added.is_empty()
+        && unit_changed.is_empty()
+        && unit_removed.is_empty()
+    {
+        return Ok((Posted::default(), PostedUnits::default()));
     }
     let Some(session) = cloud.session() else {
         return Err(crate::error::AppError::other("サインインしていません"));
@@ -193,14 +202,21 @@ pub async fn post_strokes(
         room_user_id.lock().unwrap().clone().unwrap_or_default(),
     );
 
-    let (frames, posted) = build_posts(strokes, removals, &author)?;
+    let (mut frames, posted) = build_posts(strokes, removals, &author)?;
+    let (unit_frames, posted_units) = build_unit_posts(unit_added, unit_changed, unit_removed)?;
+    frames.extend(unit_frames);
     for (booth_id, payload) in frames {
         post(&connection, &booth_id, payload).await;
     }
 
     // The posts are queued on the writer task; leaving at once would drop
     // them. Wait for the acknowledgements to have had time to come back.
-    let count = (posted.sent.len() + posted.removed.len()).min(50) as u64;
+    let count = (posted.sent.len()
+        + posted.removed.len()
+        + posted_units.added.len()
+        + posted_units.changed.len()
+        + posted_units.removed.len())
+    .min(50) as u64;
     tokio::time::sleep(Duration::from_millis(300 + 80 * count)).await;
 
     let _ = connection
@@ -210,7 +226,7 @@ pub async fn post_strokes(
         })
         .await;
     let _ = connection.commands.send(Command::Disconnect).await;
-    Ok(posted)
+    Ok((posted, posted_units))
 }
 
 /// Builds the frames a set of changes turns into, without sending anything.
@@ -263,6 +279,55 @@ pub fn author_of(
 #[derive(Debug, Default, Clone)]
 pub struct Posted {
     pub sent: Vec<String>,
+    pub removed: Vec<String>,
+}
+
+/// Builds the frames a set of unit changes turns into, without sending
+/// anything — the unit-shaped counterpart to `build_posts`.
+pub fn build_unit_posts(
+    added: &[send::PendingUnit],
+    changed: &[send::PendingUnit],
+    removed: &[send::UnitLedger],
+) -> AppResult<(Vec<Frame>, PostedUnits)> {
+    let mut ids = send::IdGenerator::fresh();
+    let mut frames = Vec::new();
+    let mut posted = PostedUnits::default();
+
+    for pending in added {
+        let (payload, element_id) =
+            send::add_unit(&pending.models, &pending.layer_id, &mut ids, None)?;
+        frames.push((pending.layer_id.clone(), payload));
+        posted.added.push((
+            pending.unit_id.clone(),
+            element_id,
+            pending.layer_id.clone(),
+        ));
+    }
+    for pending in changed {
+        let payload = send::update_unit(&pending.models, &pending.layer_id, None)?;
+        frames.push((pending.layer_id.clone(), payload));
+        posted
+            .changed
+            .push((pending.unit_id.clone(), pending.layer_id.clone()));
+    }
+    for entry in removed {
+        let payload = send::remove_element(&entry.element_id, &entry.layer_id, &mut ids, None)?;
+        frames.push((entry.layer_id.clone(), payload));
+        posted.removed.push(entry.unit_id.clone());
+    }
+    Ok((frames, posted))
+}
+
+/// What went out for units. `added` carries the room's new element id for
+/// each unit, alongside the layer it landed on — a unit's own id does not
+/// change, but there is no element id to remember until the room has one.
+/// `changed` carries no element id: an update mints none. Both are keyed so
+/// the caller can fingerprint what it just sent; `removed` is keyed the way
+/// the ledger is.
+#[derive(Debug, Default, Clone)]
+pub struct PostedUnits {
+    pub added: Vec<(String, String, String)>,
+    pub changed: Vec<(String, String)>,
     pub removed: Vec<String>,
 }
 

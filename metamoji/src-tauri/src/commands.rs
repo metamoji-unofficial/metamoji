@@ -794,7 +794,9 @@ pub async fn classbox_open_note(
 /// The note is a local copy; what makes a student's writing visible to the
 /// teacher is the room, not the file. Each stroke goes as its own Direction on
 /// the booth of the layer it is on, and is marked so a second send does not
-/// draw it twice.
+/// draw it twice. A shape, text box or form travels the same way, except that
+/// an edit to one already sent re-sends its whole model instead of adding a
+/// second copy — see `collabo::send::unit_changes`.
 #[tauri::command]
 pub async fn classbox_send_strokes(
     state: State<'_, AppState>,
@@ -813,14 +815,21 @@ pub async fn classbox_send_strokes(
         tree
     };
 
-    let ledger = {
+    let (ledger, unit_ledger) = {
         let store = state.note(&note_id)?;
-        let ledger = store.lock().unwrap().room_strokes()?;
-        ledger
+        let store = store.lock().unwrap();
+        (store.room_strokes()?, store.room_units()?)
     };
     let (waiting, removals, stale) = collabo::send::changes(&tree, &ledger);
-    if waiting.is_empty() && removals.is_empty() {
-        if stale > 0 {
+    let (unit_added, unit_changed, unit_removed, unit_stale) =
+        collabo::send::unit_changes(&tree, &unit_ledger);
+    if waiting.is_empty()
+        && removals.is_empty()
+        && unit_added.is_empty()
+        && unit_changed.is_empty()
+        && unit_removed.is_empty()
+    {
+        if stale > 0 || unit_stale > 0 {
             return Err(AppError::other(
                 "このノートは古い形式で取り込まれているため、教室に送れません。\
                  クラスボックスから開き直してください。",
@@ -856,17 +865,32 @@ pub async fn classbox_send_strokes(
     // Through the note's own connection when it has one. Opening a second and
     // logging out of it ends the room session for the whole device, which is
     // what stopped updates arriving after the first send.
-    let posted = match classroom.watch_identity(&note_id).await {
+    let (posted, posted_units) = match classroom.watch_identity(&note_id).await {
         Some((watched_room, room_user_id)) if watched_room == room_id => {
             let Some(session) = cloud.session() else {
                 return Err(AppError::other("サインインしていません"));
             };
             let author = collabo::pull::author_of(&session, &room_id, room_user_id);
-            let (frames, posted) = collabo::pull::build_posts(&waiting, &removals, &author)?;
+            let (mut frames, posted) = collabo::pull::build_posts(&waiting, &removals, &author)?;
+            let (unit_frames, posted_units) =
+                collabo::pull::build_unit_posts(&unit_added, &unit_changed, &unit_removed)?;
+            frames.extend(unit_frames);
             classroom.post_for_note(&note_id, frames).await;
-            posted
+            (posted, posted_units)
         }
-        _ => collabo::pull::post_strokes(&cloud, &classroom, &room_id, &waiting, &removals).await?,
+        _ => {
+            collabo::pull::post_strokes(
+                &cloud,
+                &classroom,
+                &room_id,
+                &waiting,
+                &removals,
+                &unit_added,
+                &unit_changed,
+                &unit_removed,
+            )
+            .await?
+        }
     };
 
     // Recorded only after the relay has had them, and only as far as it got.
@@ -880,7 +904,39 @@ pub async fn classbox_send_strokes(
     for stroke_id in &posted.removed {
         store.forget_room_stroke(stroke_id)?;
     }
-    Ok(posted.sent.len() + posted.removed.len())
+    for (pending, (unit_id, element_id, layer_id)) in
+        unit_added.iter().zip(posted_units.added.iter())
+    {
+        store.remember_room_unit(
+            unit_id,
+            element_id,
+            layer_id,
+            &collabo::send::fingerprint(&pending.models),
+        )?;
+    }
+    for (pending, (unit_id, layer_id)) in unit_changed.iter().zip(posted_units.changed.iter()) {
+        // An update mints no new element id; keep whatever the room already
+        // knows this unit by.
+        let element_id = unit_ledger
+            .iter()
+            .find(|l| &l.unit_id == unit_id)
+            .map(|l| l.element_id.clone())
+            .unwrap_or_else(|| unit_id.clone());
+        store.remember_room_unit(
+            unit_id,
+            &element_id,
+            layer_id,
+            &collabo::send::fingerprint(&pending.models),
+        )?;
+    }
+    for unit_id in &posted_units.removed {
+        store.forget_room_unit(unit_id)?;
+    }
+    Ok(posted.sent.len()
+        + posted.removed.len()
+        + posted_units.added.len()
+        + posted_units.changed.len()
+        + posted_units.removed.len())
 }
 
 /// What a resync found, in words the user can act on.
