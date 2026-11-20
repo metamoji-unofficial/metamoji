@@ -12,7 +12,7 @@ import { describe, expect, it } from "vitest";
 import { createDrawUnit, createLayer, createPage, createShapeUnit, createTextUnit } from "../model/factory";
 import { strokeBounds } from "../model/stroke";
 import type { InkPoint, PenAttributes, Page, Stroke, Unit } from "../model/types";
-import { hitsUnit, hitTestUnit } from "./hitTest";
+import { hitsUnit, hitTestUnit, resizeUnit } from "./hitTest";
 
 const pen: PenAttributes = {
   color: "#000000",
@@ -138,5 +138,47 @@ describe("hitsUnit: empty text boxes no longer shadow what's under them", () => 
 
     const hit = hitTestUnit(page, 60, 20);
     expect(hit?.unit.id).toBe(ink.id);
+  });
+});
+
+/**
+ * Regression coverage for `resizeUnit`: every `HandleType` is the literal
+ * string "resize-" plus a compass suffix, and "resize" itself contains both
+ * an "e" and an "s". Checking the *whole* handle string with
+ * `.includes("e")`/`.includes("s")` therefore matched every single handle,
+ * not just the east/south ones, silently cancelling out the real west/north
+ * resize on every handle but the bottom-right corner.
+ */
+describe("resizeUnit", () => {
+  const base = createShapeUnit(100, 100, 200, 150, "rect");
+
+  it("resize-se grows width and height without moving the origin", () => {
+    const next = resizeUnit(base, "resize-se", 20, 10, false);
+    expect(next).toEqual({ x: 100, y: 100, width: 220, height: 160 });
+  });
+
+  it("resize-nw grows the box to the upper-left instead of just dragging it", () => {
+    const next = resizeUnit(base, "resize-nw", -20, -10, false);
+    expect(next).toEqual({ x: 80, y: 90, width: 220, height: 160 });
+  });
+
+  it("resize-w only changes width and x, leaving height untouched", () => {
+    const next = resizeUnit(base, "resize-w", -20, 0, false);
+    expect(next).toEqual({ x: 80, y: 100, width: 220, height: 150 });
+  });
+
+  it("resize-n only changes height and y, leaving width untouched", () => {
+    const next = resizeUnit(base, "resize-n", 0, -10, false);
+    expect(next).toEqual({ x: 100, y: 90, width: 200, height: 160 });
+  });
+
+  it("resize-e does not perturb height on a purely horizontal drag", () => {
+    const next = resizeUnit(base, "resize-e", 20, 0, false);
+    expect(next).toEqual({ x: 100, y: 100, width: 220, height: 150 });
+  });
+
+  it("resize-s does not perturb width on a purely vertical drag", () => {
+    const next = resizeUnit(base, "resize-s", 0, 10, false);
+    expect(next).toEqual({ x: 100, y: 100, width: 200, height: 160 });
   });
 });

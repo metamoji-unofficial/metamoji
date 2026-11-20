@@ -296,24 +296,30 @@ export function resizeUnit(
 ): Pick<Unit, "x" | "y" | "width" | "height"> {
   let { x, y, width, height } = unit;
 
-  if (handle.includes("w")) {
+  // Compass suffix only ("nw", "e", "se", ...) — `handle` itself is always
+  // prefixed with "resize-", and that prefix contains both an "e" and an "s",
+  // so testing the full string with `.includes("e")`/`.includes("s")` matches
+  // every handle regardless of its actual direction.
+  const dir = handle.startsWith("resize-") ? handle.slice("resize-".length) : "";
+
+  if (dir.includes("w")) {
     const nw = width - dx;
     if (nw >= MIN_UNIT_SIZE) {
       x += dx;
       width = nw;
     }
   }
-  if (handle.includes("e")) {
+  if (dir.includes("e")) {
     width = Math.max(MIN_UNIT_SIZE, width + dx);
   }
-  if (handle.includes("n")) {
+  if (dir.includes("n")) {
     const nh = height - dy;
     if (nh >= MIN_UNIT_SIZE) {
       y += dy;
       height = nh;
     }
   }
-  if (handle.includes("s")) {
+  if (dir.includes("s")) {
     height = Math.max(MIN_UNIT_SIZE, height + dy);
   }
 
@@ -323,8 +329,8 @@ export function resizeUnit(
     if (byWidth) height = Math.max(MIN_UNIT_SIZE, width / ratio);
     else width = Math.max(MIN_UNIT_SIZE, height * ratio);
     // Corners anchored at the top or left must move so the opposite one stays put.
-    if (handle.includes("n")) y = unit.y + unit.height - height;
-    if (handle.includes("w")) x = unit.x + unit.width - width;
+    if (dir.includes("n")) y = unit.y + unit.height - height;
+    if (dir.includes("w")) x = unit.x + unit.width - width;
   }
 
   return { x, y, width, height };
