@@ -81,7 +81,13 @@ pub fn parse(bytes: Vec<u8>) -> AppResult<Listing> {
         let Ok(mut entry) = archive.by_index(index) else {
             continue;
         };
-        let full = entry.name().to_string();
+        // zip 9.x's `name()` is fallible (the on-disk encoding may not be
+        // valid UTF-8); an entry we can't even name is treated the same as
+        // any other one we can't make sense of.
+        let Ok(full) = entry.name().map(|c| c.into_owned()) else {
+            unrecognised.push(format!("<encoding error at index {index}>"));
+            continue;
+        };
         if full.ends_with('/') {
             continue;
         }

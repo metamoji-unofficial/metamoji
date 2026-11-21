@@ -7,7 +7,7 @@ fn archive(entries: &[(&str, &str)]) -> Vec<u8> {
     let mut buffer = Vec::new();
     {
         let mut writer = zip::ZipWriter::new(Cursor::new(&mut buffer));
-        let options: zip::write::FileOptions<'_, ()> =
+        let options: zip::write::FileOptions<'_, '_, ()> =
             zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
         for (name, body) in entries {
             writer.start_file(*name, options).unwrap();
