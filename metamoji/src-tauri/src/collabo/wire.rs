@@ -24,6 +24,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::error::{AppError, AppResult};
+
 /// A frame in either direction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
@@ -123,6 +125,14 @@ pub fn parse_params(text: &str) -> (String, BTreeMap<String, String>) {
 /// Stateful because a payload can straddle any number of reads, and because
 /// the length that tells us where a payload ends is inside the header that
 /// precedes it.
+/// Neither accumulation below is allowed to grow past this. A real header
+/// line is a handful of `key:value` tokens; a real edit payload is a
+/// hand-drawn stroke or an image ticket, never hundreds of megabytes. A peer
+/// (or the relay) that keeps sending bytes without a `\n`, or that announces
+/// an absurd `binary:N`, is attempting memory exhaustion, not sending data.
+const MAX_HEADER_LINE: usize = 64 * 1024;
+const MAX_PAYLOAD_SIZE: usize = 64 * 1024 * 1024;
+
 #[derive(Debug, Default)]
 pub struct Decoder {
     buffer: Vec<u8>,
@@ -135,15 +145,17 @@ impl Decoder {
         self.buffer.extend_from_slice(bytes);
     }
 
-    /// The next complete frame, or `None` if more bytes are needed.
-    pub fn next_frame(&mut self) -> Option<Frame> {
+    /// The next complete frame, `Ok(None)` if more bytes are needed, or
+    /// `Err` if the peer has exceeded a size limit — the caller should treat
+    /// that the same as any other unrecoverable connection error.
+    pub fn next_frame(&mut self) -> AppResult<Option<Frame>> {
         if let Some((frame, size)) = self.pending.take() {
             if self.buffer.len() < size {
                 self.pending = Some((frame, size));
-                return None;
+                return Ok(None);
             }
             let payload = self.buffer.drain(..size).collect();
-            return Some(frame.payload(payload));
+            return Ok(Some(frame.payload(payload)));
         }
 
         // Frames are separated by `\n`, so a leading one is noise.
@@ -151,7 +163,12 @@ impl Decoder {
             self.buffer.remove(0);
         }
 
-        let end = self.buffer.iter().position(|b| *b == b'\n')?;
+        let Some(end) = self.buffer.iter().position(|b| *b == b'\n') else {
+            if self.buffer.len() > MAX_HEADER_LINE {
+                return Err(AppError::other("collabo: ヘッダ行が長すぎます"));
+            }
+            return Ok(None);
+        };
         let line: Vec<u8> = self.buffer.drain(..end).collect();
         // Drop the terminator too, so a payload begins at offset 0.
         self.buffer.remove(0);
@@ -180,15 +197,20 @@ impl Decoder {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(0);
         if size == 0 {
-            return Some(frame);
+            return Ok(Some(frame));
+        }
+        if size > MAX_PAYLOAD_SIZE {
+            return Err(AppError::other(format!(
+                "collabo: binary:{size} が上限 {MAX_PAYLOAD_SIZE} を超えています"
+            )));
         }
 
         if self.buffer.len() < size {
             self.pending = Some((frame, size));
-            return None;
+            return Ok(None);
         }
         let payload = self.buffer.drain(..size).collect();
-        Some(frame.payload(payload))
+        Ok(Some(frame.payload(payload)))
     }
 }
 
