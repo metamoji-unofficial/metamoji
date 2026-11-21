@@ -8,7 +8,6 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router";
-import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 
 import type { CanvasController, ToolMode } from "../canvas/controller";
 import { CanvasHost } from "../components/CanvasHost";
@@ -589,16 +588,11 @@ export function EditorScreen() {
   const exportPdf = useCallback(async () => {
     const state = useEditorStore.getState();
     if (!state.doc) return;
-    const path = await saveDialog({
-      defaultPath: `${state.doc.meta.title}.pdf`,
-      filters: [{ name: "PDF", extensions: ["pdf"] }],
-    });
-    if (!path) return;
 
     setBusy(t("PDF を書き出しています…"));
     try {
       const pages = renderPagesForExport(state.doc, assets, EXPORT_DPI.print);
-      await api.exportPdf(path, state.doc.meta.title, pages);
+      await api.pickAndExportPdf(`${state.doc.meta.title}.pdf`, state.doc.meta.title, pages);
     } catch (err) {
       setLoadError(t("PDF の書き出しに失敗しました: {error}", { error: String(err) }));
     } finally {

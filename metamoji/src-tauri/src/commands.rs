@@ -832,6 +832,8 @@ pub async fn classbox_open_note(
         title: result.title,
         room,
         room_id,
+        // Pulled from a classroom room, not a local file.
+        file_name: None,
     })
 }
 

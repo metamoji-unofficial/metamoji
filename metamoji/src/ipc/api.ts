@@ -118,6 +118,8 @@ export interface AtdocImportResult {
   room: RoomPull | null;
   /** The room the note belongs to, to be remembered alongside it. */
   roomId: string | null;
+  /** The imported file's own name (no extension). Absent for a room pull. */
+  fileName: string | null;
 }
 
 export interface ExportPagePayload {
@@ -363,30 +365,31 @@ export async function pickAndWriteFile(
 // .atdoc import
 // ---------------------------------------------------------------------------
 
-export async function atdocImport(
-  path: string,
-  newRootId: string,
-): Promise<AtdocImportResult> {
+/**
+ * Shows a native "open file" dialog for a `.atdoc` file and imports it. The
+ * path is picked and resolved entirely on the Rust side, never supplied by
+ * the webview. Returns null if the user cancelled the dialog.
+ */
+export async function pickAndImportAtdoc(newRootId: string): Promise<AtdocImportResult | null> {
   if (!isTauri()) return memoryBackend.atdocImport();
-  return invoke<AtdocImportResult>("atdoc_import", { path, newRootId });
-}
-
-export async function atdocProbe(path: string): Promise<number> {
-  if (!isTauri()) throw new Error(".atdoc の判定はデスクトップアプリでのみ利用できます");
-  return invoke<number>("atdoc_probe", { path });
+  return invoke<AtdocImportResult | null>("pick_and_import_atdoc", { newRootId });
 }
 
 // ---------------------------------------------------------------------------
 // Export
 // ---------------------------------------------------------------------------
 
-export async function exportPdf(
-  path: string,
+/**
+ * Shows a native "save file" dialog and writes the note out as a PDF there.
+ * Returns false if the user cancelled the dialog.
+ */
+export async function pickAndExportPdf(
+  defaultName: string,
   title: string,
   pages: ExportPagePayload[],
-): Promise<void> {
+): Promise<boolean> {
   if (!isTauri()) throw new Error("PDF の書き出しはデスクトップアプリでのみ利用できます");
-  return invoke("export_pdf", { path, title, pages });
+  return invoke<boolean>("pick_and_export_pdf", { defaultName, title, pages });
 }
 
 // ---------------------------------------------------------------------------
