@@ -42,6 +42,15 @@ fn login_ok() -> String {
         .to_string()
 }
 
+/// `login_ok`, plus the `qwd` a server can hand back alongside the session
+/// (`CsLoginResponse.qwd`, `docs/typespec/auth/auth.tsp`).
+fn login_ok_with_qwd() -> String {
+    r#"{"uuid":"u-1","loginName":"student01","name":"山田 太郎",
+        "email":"a@example.jp","companyId":"c-1","companyName":"例示小学校",
+        "companyVersion":3,"serverVersion":2.0,"qwd":"q-1"}"#
+        .to_string()
+}
+
 #[test]
 fn the_root_server_defaults_to_the_documented_one() {
     // `ModelInfo$BuildOptions.DIGITAL_CABINET_URL_ROOT`.
@@ -654,6 +663,68 @@ async fn a_session_saved_before_the_method_was_recorded_still_renews() {
     assert_eq!(seen[1].path, "/mmjeditor2/2.0/users3/login");
     assert_eq!(seen[1].json()["loginName"], "student01");
     assert_eq!(seen[2].path, "/mmjeditor2/2.0/drives/entry");
+}
+
+#[tokio::test]
+async fn a_qwd_from_the_login_response_is_what_reauthentication_uses_next() {
+    // `/users3/login` can hand back a `qwd` (`CsLoginResponse.qwd`) alongside
+    // the session it approves, and `CsLoginParam` accepts one in place of a
+    // password. Once a response has offered one there is no reason left to
+    // keep the password around for the next renewal — this is also the only
+    // avenue by which a restart (same store path) can recover without ever
+    // having the password in hand again.
+    let path = temp_path("qwd.json");
+    let _ = std::fs::remove_file(&path);
+
+    {
+        let stub = stub(vec![
+            ("200 OK", SCHOOL_OK.to_string()),
+            ("200 OK", login_ok_with_qwd()),
+        ]);
+        let client = client_at(&path);
+        client.set_root_server(&stub.base);
+        client
+            .login("school01", "student01", "hunter2")
+            .await
+            .unwrap();
+    }
+
+    // The credential never lands in the file at all — it goes through the OS
+    // keyring (a per-path in-memory stand-in under `#[cfg(test)]`), not here.
+    let mut saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(
+        saved.get("credential").is_none(),
+        "session.json must never carry the credential: {saved}"
+    );
+
+    // The old session pointed at a stub that has now stopped; repoint it at a
+    // live one without going through `set_root_server`, which clears sessions.
+    let stub = stub(vec![
+        ("200 OK", r#"{"data":{"errorCode":106}}"#.to_string()),
+        ("200 OK", login_ok()),
+        (
+            "200 OK",
+            r#"{"list":[{"id":"d-1","name":"1年1組"}]}"#.to_string(),
+        ),
+    ]);
+    for key in ["root_server", "rest_host"] {
+        saved[key] = serde_json::json!(stub.base);
+    }
+    saved["school"]["serverUrl"] = serde_json::json!(stub.base);
+    std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+
+    let client = client_at(&path);
+    let entries = client.drive_entries().await;
+    assert!(entries.is_ok(), "{:?}", entries.err());
+
+    let seen: Vec<_> = (0..3).map(|_| stub.seen.recv().unwrap()).collect();
+    let renewal = seen[1].json();
+    assert_eq!(renewal["qwd"], "q-1");
+    assert!(
+        renewal.get("password").is_none(),
+        "renewal must not resend a password once a qwd exists: {renewal}"
+    );
 }
 
 /// No test may reach the network.

@@ -28,16 +28,33 @@
 //! Signing in on every launch is not a security posture, it is an obstacle —
 //! and the original does not do it either (`CsDCUserInfoSettings` keeps the
 //! credential so `executeWithAutoLoginFor` can re-authenticate silently). So
-//! the cookie jar, the identity and the credential are written to
-//! `session.json` in the app data directory, `0600` where the platform has
-//! permissions.
+//! the cookie jar and the identity are written to `session.json` in the app
+//! data directory, `0600` where the platform has permissions.
 //!
-//! The credential is there because `cosmos/*` — the classroom rooms — sends it
-//! in a JSON part on **every request** rather than relying on the cookie
-//! (`collabo/rest.rs`). Persisting the cookie alone would leave the classroom
-//! broken after a restart while everything else worked, which is a worse
-//! failure than an honest one.
+//! The credential itself — the one thing that is not the user's to shrug off
+//! if it leaks — does **not** go in that file. It lives in the OS's own
+//! credential store (Keychain / Credential Manager / Secret Service, via the
+//! `keyring` crate; see `keyring_entry` below), which is a different trust
+//! boundary from "any process that can read a file this app owns". It is
+//! there because `cosmos/*` — the classroom rooms — sends it in a JSON part on
+//! **every request** rather than relying on the cookie (`collabo/rest.rs`).
+//! Persisting the cookie alone would leave the classroom broken after a
+//! restart while everything else worked, which is a worse failure than an
+//! honest one.
+//!
+//! What's actually kept is, where the server supports it, a `qwd` — the
+//! original's own silent-re-login token (`CsLoginResponse.qwd`,
+//! `docs/typespec/auth/auth.tsp`) — rather than the password itself. `/users3/login`
+//! accepts either in `CsLoginParam`, so once a login response has handed one
+//! over there is no further reason to hold the password at all: `login_with`
+//! prefers whatever token the most recent response offered, and only falls
+//! back to re-sending the password if the server never issues one. The one
+//! account form this does not apply to is the classroom (student) login:
+//! `CsClassRoomLoginParam` has no `qwd` field, so that path keeps the password
+//! as its only way back in.
 
+#[cfg(test)]
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -117,8 +134,104 @@ pub struct ClassGroup {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Credential {
     Password(String),
-    /// The pre-shared token a QR code carries.
+    /// The pre-shared token a QR code carries, or the one `/users3/login`
+    /// hands back after a password sign-in (`CsLoginResponse.qwd`).
     Qwd(String),
+}
+
+/// `keyring`'s service/account pair for the one credential this client ever
+/// holds at a time (`Inner.credential` is a single `Option`, not a map — one
+/// slot deserves one fixed key, not an invented per-user namespace).
+const KEYRING_SERVICE: &str = "com.unischool.metamoji.cloud-credential";
+const KEYRING_ACCOUNT: &str = "default";
+
+fn keyring_entry() -> AppResult<keyring::Entry> {
+    keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
+        .map_err(|e| AppError::other(format!("OSの資格情報ストアを開けません: {e}")))
+}
+
+/// Reads the credential back out, if the OS store still has one. Absence
+/// (never signed in, or a store the platform has none of) is not an error —
+/// callers already treat "no credential" as the ordinary signed-out state.
+///
+/// `store_path` is the same path `session.json` goes to, used here only to
+/// key the in-test stand-in below — production always reads the one real
+/// entry regardless of it, since one install only ever has one `session.json`
+/// path anyway.
+#[cfg(not(test))]
+fn load_credential_from_keyring(_store_path: Option<&PathBuf>) -> Option<Credential> {
+    let entry = keyring_entry().ok()?;
+    let json = entry.get_password().ok()?;
+    serde_json::from_str(&json).ok()
+}
+
+/// Writes (or, for `None`, removes) the stored credential. Unlike
+/// `session.json` this never goes through this type's own `persist`-failure
+/// tolerance: a credential that silently failed to save would look signed in
+/// until the next restart, then demand a password the user thought was
+/// remembered — worse than surfacing the failure in the log now.
+#[cfg(not(test))]
+fn save_credential_to_keyring(_store_path: Option<&PathBuf>, credential: Option<&Credential>) {
+    let Ok(entry) = keyring_entry() else {
+        log::warn!("could not open the OS credential store");
+        return;
+    };
+
+    let result = match credential {
+        Some(credential) => {
+            let json = match serde_json::to_string(credential) {
+                Ok(json) => json,
+                Err(e) => {
+                    log::warn!("could not serialise the credential: {e}");
+                    return;
+                }
+            };
+            entry.set_password(&json)
+        }
+        None => entry.delete_credential(),
+    };
+
+    match result {
+        Ok(()) => {}
+        // Nothing to remove is the outcome a clear/logout asked for, not a failure.
+        Err(keyring::Error::NoEntry) if credential.is_none() => {}
+        Err(e) => log::warn!("could not update the OS credential store: {e}"),
+    }
+}
+
+/// Test builds never touch the real OS credential store: a CI runner's
+/// keychain/Secret Service is not reliably present or unlockable headlessly,
+/// and even on a developer machine a test has no business reading or
+/// overwriting whatever the developer is actually signed in with.
+///
+/// Keyed by `store_path`, the same way the real file is one per test (see
+/// `client_at` in `cloud_wire_tests.rs`) — a `None` path (most tests) shares
+/// one slot, matching production's "no persistence at all" for that case, and
+/// each distinct path used for a restart-simulation test gets its own,
+/// independent of every other test running in parallel in the same process.
+#[cfg(test)]
+fn test_keyring() -> &'static Mutex<HashMap<Option<PathBuf>, Credential>> {
+    use std::sync::OnceLock;
+    static STORE: OnceLock<Mutex<HashMap<Option<PathBuf>, Credential>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn load_credential_from_keyring(store_path: Option<&PathBuf>) -> Option<Credential> {
+    test_keyring().lock().unwrap().get(&store_path.cloned()).cloned()
+}
+
+#[cfg(test)]
+fn save_credential_to_keyring(store_path: Option<&PathBuf>, credential: Option<&Credential>) {
+    let mut store = test_keyring().lock().unwrap();
+    match credential {
+        Some(c) => {
+            store.insert(store_path.cloned(), c.clone());
+        }
+        None => {
+            store.remove(&store_path.cloned());
+        }
+    }
 }
 
 /// How the session was established.
@@ -135,6 +248,14 @@ pub enum LoginMethod {
         class_group_id: String,
         id_number: String,
     },
+}
+
+/// What `login_with` sends `/users3/login` to authenticate with — not
+/// `Credential` itself, since that one is also what gets persisted, and a
+/// by-reference borrow here avoids cloning a secret just to send it once.
+enum LoginAuth<'a> {
+    Password(&'a str),
+    Qwd(&'a str),
 }
 
 /// One drive the user belongs to.
@@ -220,13 +341,15 @@ pub struct CloudClient {
 }
 
 /// Everything needed to pick a session back up after a restart.
+///
+/// Deliberately no `credential` field: that one goes through the OS credential
+/// store instead (`keyring_entry` and friends, above), not this file.
 #[derive(Default, Serialize, Deserialize)]
 struct Persisted {
     root_server: Option<String>,
     rest_host: Option<String>,
     school: Option<School>,
     session: Option<CloudSession>,
-    credential: Option<Credential>,
     method: Option<LoginMethod>,
     cookies: Option<Value>,
 }
@@ -261,6 +384,15 @@ impl CloudClient {
             .build()
             .map_err(|e| AppError::other(format!("HTTP クライアントを作成できません: {e}")))?;
 
+        // Mirrors `store_path`: a client with nowhere to persist to (tests) must
+        // not read the real machine's credential store either, or a test run
+        // would pick up — and overwrite — whatever the developer is actually
+        // signed in with.
+        let credential = store_path
+            .is_some()
+            .then(|| load_credential_from_keyring(store_path.as_ref()))
+            .flatten();
+
         Ok(Self {
             http,
             cookies,
@@ -269,7 +401,7 @@ impl CloudClient {
                 root_server: saved
                     .root_server
                     .unwrap_or_else(|| DEFAULT_ROOT_SERVER.to_string()),
-                credential: saved.credential,
+                credential,
                 method: saved.method,
                 rest_host: saved.rest_host,
                 school: saved.school,
@@ -290,14 +422,13 @@ impl CloudClient {
             return;
         };
 
-        let snapshot = {
+        let (snapshot, credential) = {
             let inner = self.inner.lock().unwrap();
-            Persisted {
+            let snapshot = Persisted {
                 root_server: Some(inner.root_server.clone()),
                 rest_host: inner.rest_host.clone(),
                 school: inner.school.clone(),
                 session: inner.session.clone(),
-                credential: inner.credential.clone(),
                 method: inner.method.clone(),
                 cookies: {
                     let mut buffer = Vec::new();
@@ -312,8 +443,11 @@ impl CloudClient {
                     .ok()
                     .and_then(|_| serde_json::from_slice(&buffer).ok())
                 },
-            }
+            };
+            (snapshot, inner.credential.clone())
         };
+
+        save_credential_to_keyring(Some(path), credential.as_ref());
 
         let Ok(json) = serde_json::to_vec_pretty(&snapshot) else {
             return;
@@ -510,8 +644,12 @@ impl CloudClient {
 
     /// Re-authenticates with the stored credential.
     ///
-    /// Only useful for a password: `cosmos/*` can present a `qwd` per request,
-    /// but `/users3/login` wants the password it was given.
+    /// A `Normal` login accepts either a password or a `qwd` at `/users3/login`
+    /// (`CsLoginParam`), so either stored form is enough to get back in. A
+    /// `Classroom` login has no such field (`CsClassRoomLoginParam`), so that
+    /// path only ever works from a password — a `Qwd` recorded under a
+    /// `Classroom` method (which should not happen; `classroom_login` never
+    /// stores one) would have nothing to replay it with.
     async fn reauthenticate(&self) -> AppResult<()> {
         let (school, credential, method) = {
             let inner = self.inner.lock().unwrap();
@@ -545,21 +683,22 @@ impl CloudClient {
                 return Err(AppError::NotLoggedIn);
             }
         }
-        let Credential::Password(password) = credential else {
-            // A `qwd` is what `cosmos/*` presents per request; `/users3/login`
-            // wants the password, and this client never saw one.
-            return Err(AppError::NotLoggedIn);
-        };
-
         match method {
             LoginMethod::Normal { login_name } => {
-                self.login(&school, &login_name, &password).await?;
+                let auth = match &credential {
+                    Credential::Password(password) => LoginAuth::Password(password),
+                    Credential::Qwd(qwd) => LoginAuth::Qwd(qwd),
+                };
+                self.login_with(&school, &login_name, auth).await?;
             }
             LoginMethod::Classroom {
                 class_group_id,
                 id_number,
             } => {
-                self.classroom_login(&school, &class_group_id, &id_number, &password)
+                let Credential::Password(password) = &credential else {
+                    return Err(AppError::NotLoggedIn);
+                };
+                self.classroom_login(&school, &class_group_id, &id_number, password)
                     .await?;
             }
         }
@@ -690,19 +829,55 @@ impl CloudClient {
         login_name: &str,
         password: &str,
     ) -> AppResult<CloudSession> {
+        self.login_with(co_login_id, login_name, LoginAuth::Password(password))
+            .await
+    }
+
+    /// `login`'s underlying call, parametrised over what `/users3/login` is
+    /// actually handed — a password or a previously-issued `qwd`
+    /// (`CsLoginParam` accepts either). Used both for the user's first,
+    /// password-only sign-in and for `reauthenticate`'s silent retry, which
+    /// may only have a `qwd` left to offer.
+    async fn login_with(
+        &self,
+        co_login_id: &str,
+        login_name: &str,
+        auth: LoginAuth<'_>,
+    ) -> AppResult<CloudSession> {
         let mut params = self.base_params();
         params.insert("coLoginId".into(), json!(co_login_id));
         params.insert("loginName".into(), json!(login_name));
-        params.insert("password".into(), json!(password));
+        match auth {
+            LoginAuth::Password(password) => {
+                params.insert("password".into(), json!(password));
+            }
+            LoginAuth::Qwd(qwd) => {
+                params.insert("qwd".into(), json!(qwd));
+            }
+        }
 
         let school = self.school_for(co_login_id).await?;
         let body = self
             .command_once(co_login_id, "/users3/login", params)
             .await?;
+        // A response can hand back a fresh `qwd` (`CsLoginResponse.qwd`)
+        // regardless of which credential unlocked it — read it before
+        // `finish_login` consumes the body.
+        let issued_qwd = scalar_str(body.get("qwd"));
         let session = self.finish_login(&school, body)?;
         {
             let mut inner = self.inner.lock().unwrap();
-            inner.credential = Some(Credential::Password(password.to_string()));
+            // Prefer whatever the server just issued; otherwise keep using
+            // whichever credential this call was actually authenticated with,
+            // so a `Qwd`-based reauthentication does not quietly regress to
+            // needing a password nobody has anymore.
+            inner.credential = Some(match issued_qwd {
+                Some(qwd) => Credential::Qwd(qwd),
+                None => match auth {
+                    LoginAuth::Password(password) => Credential::Password(password.to_string()),
+                    LoginAuth::Qwd(qwd) => Credential::Qwd(qwd.to_string()),
+                },
+            });
             inner.method = Some(LoginMethod::Normal {
                 login_name: login_name.to_string(),
             });

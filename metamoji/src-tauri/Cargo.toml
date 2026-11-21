@@ -41,6 +41,7 @@ rustls = "0.23.43"
 webpki-roots = "1.0.9"
 reqwest_cookie_store = "0.10.0"
 cookie_store = "0.22.1"
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 
 [dev-dependencies]
 tokio = { version = "1.53.1", features = ["rt", "macros"] }
