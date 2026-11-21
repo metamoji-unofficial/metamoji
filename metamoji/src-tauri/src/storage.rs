@@ -781,6 +781,19 @@ impl NoteStore {
                 layer_id   TEXT NOT NULL
             );
 
+            -- The same bookkeeping as room_strokes, for units that can be
+            -- edited in place rather than only drawn once and erased: a
+            -- shape, text box or form keeps its own id for life, so telling
+            -- "unchanged" from "edited" needs more than presence — hence
+            -- fingerprint, a hash of the unit's own subtree as it stood the
+            -- last time this note told the room about it.
+            CREATE TABLE IF NOT EXISTS room_units (
+                unit_id     TEXT PRIMARY KEY,
+                element_id  TEXT NOT NULL,
+                layer_id    TEXT NOT NULL,
+                fingerprint TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS assets (
                 id       TEXT PRIMARY KEY,
                 mime     TEXT NOT NULL,
@@ -998,6 +1011,44 @@ impl NoteStore {
         self.conn.execute(
             "DELETE FROM room_strokes WHERE stroke_id = ?1",
             params![stroke_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn remember_room_unit(
+        &self,
+        unit_id: &str,
+        element_id: &str,
+        layer_id: &str,
+        fingerprint: &str,
+    ) -> AppResult<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO room_units(unit_id, element_id, layer_id, fingerprint)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![unit_id, element_id, layer_id, fingerprint],
+        )?;
+        Ok(())
+    }
+
+    pub fn room_units(&self) -> AppResult<Vec<crate::collabo::send::UnitLedger>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT unit_id, element_id, layer_id, fingerprint FROM room_units ORDER BY unit_id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(crate::collabo::send::UnitLedger {
+                unit_id: r.get(0)?,
+                element_id: r.get(1)?,
+                layer_id: r.get(2)?,
+                fingerprint: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn forget_room_unit(&self, unit_id: &str) -> AppResult<()> {
+        self.conn.execute(
+            "DELETE FROM room_units WHERE unit_id = ?1",
+            params![unit_id],
         )?;
         Ok(())
     }
