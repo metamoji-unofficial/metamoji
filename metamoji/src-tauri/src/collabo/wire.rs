@@ -219,7 +219,7 @@ impl Decoder {
 pub struct PacketCounter(u64);
 
 impl PacketCounter {
-    pub fn next(&mut self) -> String {
+    pub fn next_number(&mut self) -> String {
         let n = self.0;
         self.0 += 1;
         format!("C{n}")

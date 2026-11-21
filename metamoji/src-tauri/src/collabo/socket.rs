@@ -383,7 +383,7 @@ where
             if matches!(command, Command::Disconnect) {
                 break;
             }
-            let bytes = command.to_frame().encode(&counter.next());
+            let bytes = command.to_frame().encode(&counter.next_number());
             if writer.write_all(&bytes).await.is_err() {
                 break;
             }

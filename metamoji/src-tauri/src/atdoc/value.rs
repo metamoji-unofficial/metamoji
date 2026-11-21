@@ -119,7 +119,7 @@ fn read_value_at(r: &mut Reader, depth: usize) -> AppResult<Value> {
         TAG_POINTS => {
             // Byte length, not point count, and always float32 x/y pairs.
             let byte_len = r.u32()? as usize;
-            if byte_len % 8 != 0 {
+            if !byte_len.is_multiple_of(8) {
                 return Err(AppError::other(
                     "point array byte length is not a multiple of 8",
                 ));

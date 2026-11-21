@@ -315,6 +315,10 @@ impl Catalog {
         Ok(())
     }
 
+    // One column in, one parameter out — splitting this into a struct would
+    // just move the same eight values one layer away from their SQL column
+    // names without reducing anything a caller has to track.
+    #[allow(clippy::too_many_arguments)]
     pub fn upsert(
         &self,
         id: &str,
@@ -707,6 +711,10 @@ fn fts_query(input: &str) -> Option<String> {
     (!terms.is_empty()).then(|| terms.join(" "))
 }
 
+// Sits next to `fts_query` rather than at the end of the file, where the
+// convention of one test module per file would put it — that query is the
+// one piece of this file worth reading in isolation from `NoteStore`.
+#[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod fts_tests {
     use super::fts_query;

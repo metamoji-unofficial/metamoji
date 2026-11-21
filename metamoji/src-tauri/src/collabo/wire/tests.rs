@@ -153,9 +153,9 @@ fn a_declared_payload_size_past_the_limit_is_rejected() {
 #[test]
 fn packet_numbers_are_the_documented_sequence() {
     let mut counter = PacketCounter::default();
-    assert_eq!(counter.next(), "C0");
-    assert_eq!(counter.next(), "C1");
-    assert_eq!(counter.next(), "C2");
+    assert_eq!(counter.next_number(), "C0");
+    assert_eq!(counter.next_number(), "C1");
+    assert_eq!(counter.next_number(), "C2");
 }
 
 #[test]
