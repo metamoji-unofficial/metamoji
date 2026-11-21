@@ -5,7 +5,7 @@ fn decode_all(chunks: &[&[u8]]) -> Vec<Frame> {
     let mut out = Vec::new();
     for chunk in chunks {
         decoder.push(chunk);
-        while let Some(frame) = decoder.next_frame() {
+        while let Some(frame) = decoder.next_frame().expect("within limits") {
             out.push(frame);
         }
     }
@@ -122,19 +122,40 @@ fn a_payload_split_across_reads_is_reassembled() {
 fn a_header_arriving_without_its_payload_yields_nothing_yet() {
     let mut decoder = Decoder::default();
     decoder.push(b"\nb1\tS1\tcmd:PostData binary:4\nab");
-    assert!(decoder.next_frame().is_none());
+    assert!(decoder.next_frame().expect("within limits").is_none());
 
     decoder.push(b"cd");
-    let frame = decoder.next_frame().expect("payload completed");
+    let frame = decoder
+        .next_frame()
+        .expect("within limits")
+        .expect("payload completed");
     assert_eq!(frame.payload, b"abcd".to_vec());
+}
+
+#[test]
+fn a_header_line_past_the_limit_is_rejected() {
+    let mut decoder = Decoder::default();
+    // No `\n` anywhere in this chunk, so the decoder has nothing to parse —
+    // only to keep buffering, which is exactly the DoS this limit prevents.
+    let garbage = vec![b'a'; MAX_HEADER_LINE + 1];
+    decoder.push(&garbage);
+    assert!(decoder.next_frame().is_err());
+}
+
+#[test]
+fn a_declared_payload_size_past_the_limit_is_rejected() {
+    let mut decoder = Decoder::default();
+    let header = format!("\nb1\tS1\tcmd:PostData binary:{}\n", MAX_PAYLOAD_SIZE + 1);
+    decoder.push(header.as_bytes());
+    assert!(decoder.next_frame().is_err());
 }
 
 #[test]
 fn packet_numbers_are_the_documented_sequence() {
     let mut counter = PacketCounter::default();
-    assert_eq!(counter.next(), "C0");
-    assert_eq!(counter.next(), "C1");
-    assert_eq!(counter.next(), "C2");
+    assert_eq!(counter.next_number(), "C0");
+    assert_eq!(counter.next_number(), "C1");
+    assert_eq!(counter.next_number(), "C2");
 }
 
 #[test]

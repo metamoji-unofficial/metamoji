@@ -518,7 +518,7 @@ mod tests {
 
     #[test]
     fn rejects_a_file_without_the_magic_number() {
-        assert!(parse_header(&vec![0u8; 128]).is_err());
+        assert!(parse_header(&[0u8; 128]).is_err());
     }
 
     #[test]

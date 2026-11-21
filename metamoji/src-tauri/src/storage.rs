@@ -43,8 +43,19 @@ impl AppPaths {
         })
     }
 
-    pub fn note_path(&self, id: &str) -> PathBuf {
-        self.notes_dir.join(format!("{id}.mmnote"))
+    pub fn note_path(&self, id: &str) -> AppResult<PathBuf> {
+        // `id` is an IPC-supplied string. This app only ever issues UUID-shaped
+        // ids itself, so traversal/separator characters here can only mean the
+        // webview boundary is being abused.
+        if id.is_empty()
+            || id.contains('/')
+            || id.contains('\\')
+            || id.contains("..")
+            || Path::new(id).is_absolute()
+        {
+            return Err(AppError::other("不正な note_id です"));
+        }
+        Ok(self.notes_dir.join(format!("{id}.mmnote")))
     }
 }
 
@@ -304,6 +315,10 @@ impl Catalog {
         Ok(())
     }
 
+    // One column in, one parameter out — splitting this into a struct would
+    // just move the same eight values one layer away from their SQL column
+    // names without reducing anything a caller has to track.
+    #[allow(clippy::too_many_arguments)]
     pub fn upsert(
         &self,
         id: &str,
@@ -696,6 +711,10 @@ fn fts_query(input: &str) -> Option<String> {
     (!terms.is_empty()).then(|| terms.join(" "))
 }
 
+// Sits next to `fts_query` rather than at the end of the file, where the
+// convention of one test module per file would put it — that query is the
+// one piece of this file worth reading in isolation from `NoteStore`.
+#[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod fts_tests {
     use super::fts_query;

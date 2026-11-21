@@ -142,9 +142,15 @@ pub enum Credential {
 /// `keyring`'s service/account pair for the one credential this client ever
 /// holds at a time (`Inner.credential` is a single `Option`, not a map — one
 /// slot deserves one fixed key, not an invented per-user namespace).
+// Both only have callers under `load_credential_from_keyring`/
+// `save_credential_to_keyring`, which are `#[cfg(not(test))]` — so in a test
+// build these are genuinely unused, not forgotten.
+#[cfg_attr(test, allow(dead_code))]
 const KEYRING_SERVICE: &str = "com.unischool.metamoji.cloud-credential";
+#[cfg_attr(test, allow(dead_code))]
 const KEYRING_ACCOUNT: &str = "default";
 
+#[cfg_attr(test, allow(dead_code))]
 fn keyring_entry() -> AppResult<keyring::Entry> {
     keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
         .map_err(|e| AppError::other(format!("OSの資格情報ストアを開けません: {e}")))

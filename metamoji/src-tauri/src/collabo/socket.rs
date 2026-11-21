@@ -383,7 +383,7 @@ where
             if matches!(command, Command::Disconnect) {
                 break;
             }
-            let bytes = command.to_frame().encode(&counter.next());
+            let bytes = command.to_frame().encode(&counter.next_number());
             if writer.write_all(&bytes).await.is_err() {
                 break;
             }
@@ -411,17 +411,31 @@ where
             };
 
             decoder.push(&buffer[..count]);
-            while let Some(frame) = decoder.next_frame() {
-                trace(&frame);
-                if frame.command == "Ping" {
-                    // Answered here rather than surfaced: nothing above this
-                    // layer can do anything useful with a ping.
-                    let _ = ping_tx.try_send(Command::PingResult);
-                    continue;
+            let mut over_limit = None;
+            loop {
+                match decoder.next_frame() {
+                    Ok(Some(frame)) => {
+                        trace(&frame);
+                        if frame.command == "Ping" {
+                            // Answered here rather than surfaced: nothing
+                            // above this layer can do anything useful with a
+                            // ping.
+                            let _ = ping_tx.try_send(Command::PingResult);
+                            continue;
+                        }
+                        if let Some(event) = event_for(&frame) {
+                            events(event);
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        over_limit = Some(e.to_string());
+                        break;
+                    }
                 }
-                if let Some(event) = event_for(&frame) {
-                    events(event);
-                }
+            }
+            if let Some(reason) = over_limit {
+                break reason;
             }
         };
 

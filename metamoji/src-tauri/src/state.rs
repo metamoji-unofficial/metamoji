@@ -28,6 +28,7 @@ impl AppState {
     ///   1. resolve and create directories
     ///   2. open the catalog and run migrations
     ///   3. publish state
+    ///
     /// Anything that needs a later step must be a method, not a constructor
     /// side effect — that discipline is what the original was missing.
     pub fn boot(data_dir: PathBuf) -> AppResult<Self> {
@@ -60,7 +61,7 @@ impl AppState {
         if let Some(store) = self.open_notes.read().unwrap().get(id) {
             return Ok(Arc::clone(store));
         }
-        let path = self.paths.note_path(id);
+        let path = self.paths.note_path(id)?;
         let store = Arc::new(Mutex::new(NoteStore::open(&path)?));
         self.open_notes
             .write()

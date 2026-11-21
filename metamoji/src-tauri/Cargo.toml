@@ -31,7 +31,7 @@ chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
 base64 = "0.22"
 log = "0.4"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 printpdf = { version = "0.7", default-features = false, features = ["embedded_images"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "cookies", "rustls", "charset", "http2", "system-proxy", "multipart", "form"] }

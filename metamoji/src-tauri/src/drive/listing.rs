@@ -60,6 +60,11 @@ const FOLDERS: &str = "folderdefs_";
 const ORDERS: &str = "childrenorders_";
 const KNOWN_BUT_UNUSED: [&str; 4] = ["tagdefs_", "tagorder.json", "drive.json", "meta.json"];
 
+/// Caps how much of one entry's decompressed text this reads. Real entries
+/// (`documents_N.json` etc.) are a few KB to a few hundred KB; a sync payload
+/// claiming to need more than this is a decompression bomb, not real data.
+const MAX_ENTRY_TEXT_LEN: u64 = 32 * 1024 * 1024;
+
 /// Decodes the zip a drive hands back.
 pub fn parse(bytes: Vec<u8>) -> AppResult<Listing> {
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
@@ -76,7 +81,13 @@ pub fn parse(bytes: Vec<u8>) -> AppResult<Listing> {
         let Ok(mut entry) = archive.by_index(index) else {
             continue;
         };
-        let full = entry.name().to_string();
+        // zip 9.x's `name()` is fallible (the on-disk encoding may not be
+        // valid UTF-8); an entry we can't even name is treated the same as
+        // any other one we can't make sense of.
+        let Ok(full) = entry.name().map(|c| c.into_owned()) else {
+            unrecognised.push(format!("<encoding error at index {index}>"));
+            continue;
+        };
         if full.ends_with('/') {
             continue;
         }
@@ -84,7 +95,12 @@ pub fn parse(bytes: Vec<u8>) -> AppResult<Listing> {
         let name = full.rsplit('/').next().unwrap_or(&full).to_string();
 
         let mut text = String::new();
-        if entry.read_to_string(&mut text).is_err() {
+        if entry
+            .by_ref()
+            .take(MAX_ENTRY_TEXT_LEN)
+            .read_to_string(&mut text)
+            .is_err()
+        {
             unrecognised.push(name);
             continue;
         }
@@ -286,12 +302,22 @@ fn split_children(value: Option<&str>) -> Vec<String> {
 }
 
 /// A folder path with exactly one slash at each end.
+///
+/// `.`/`..` segments are dropped outright: this is a display hierarchy coming
+/// straight off a document's `tags` field (sync data, not trusted input), and
+/// it later gets joined onto a real filesystem path in
+/// `commands::sub_directory`, so a traversal segment surviving here would
+/// become one there.
 fn normalise_path(path: &str) -> String {
     let trimmed = path.trim().trim_matches('/');
-    if trimmed.is_empty() {
+    let cleaned: Vec<&str> = trimmed
+        .split('/')
+        .filter(|seg| !seg.is_empty() && *seg != "." && *seg != "..")
+        .collect();
+    if cleaned.is_empty() {
         "/".to_string()
     } else {
-        format!("/{trimmed}/")
+        format!("/{}/", cleaned.join("/"))
     }
 }
 

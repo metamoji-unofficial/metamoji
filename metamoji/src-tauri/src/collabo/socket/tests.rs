@@ -7,13 +7,19 @@ fn round_trip(command: &Command) -> Frame {
     let bytes = command.to_frame().encode("C7");
     let mut decoder = Decoder::default();
     decoder.push(&bytes);
-    decoder.next_frame().expect("one whole frame")
+    decoder
+        .next_frame()
+        .expect("within limits")
+        .expect("one whole frame")
 }
 
 fn push(line: &str) -> Frame {
     let mut decoder = Decoder::default();
     decoder.push(format!("\n{line}\n").as_bytes());
-    decoder.next_frame().expect("one whole frame")
+    decoder
+        .next_frame()
+        .expect("within limits")
+        .expect("one whole frame")
 }
 
 #[test]
@@ -73,7 +79,10 @@ fn an_edit_may_arrive_base64_in_a_parameter_instead_of_as_bytes() {
 fn decode(line: &str) -> Frame {
     let mut decoder = Decoder::default();
     decoder.push(format!("\n{line}\n").as_bytes());
-    decoder.next_frame().expect("one whole frame")
+    decoder
+        .next_frame()
+        .expect("within limits")
+        .expect("one whole frame")
 }
 
 #[test]
@@ -159,7 +168,7 @@ fn an_incoming_direction_takes_its_booth_from_the_frame() {
     // `bid` is not a parameter on this push — the channel is the frame's own.
     let mut decoder = Decoder::default();
     decoder.push(b"\nbooth-5\tS2\tcmd:PostData seq:41 uid:U3 self:1 binary:2\nhi");
-    let frame = decoder.next_frame().unwrap();
+    let frame = decoder.next_frame().unwrap().unwrap();
 
     match event_for(&frame).unwrap() {
         CollaboEvent::Direction {
