@@ -378,24 +378,70 @@ pub fn asset_list(state: State<'_, AppState>, note_id: String) -> AppResult<Vec<
     Ok(ids)
 }
 
-/// Reads a file the user picked in a dialog and returns it as a data URL.
-/// The path comes from the dialog plugin, never from the webview's imagination.
+/// Shows a native "open file" dialog and, if the user picks one, reads it and
+/// returns it as a data URL. The path never crosses the IPC boundary: the
+/// webview supplies only the filter, and the pick + read happen here in one
+/// step, so a malicious script cannot hand this command a path of its own
+/// choosing (see `reports/vulnerabilities/001_arbitrary-file-read-write-via-ipc.md`).
 #[tauri::command]
-pub fn file_read_data_url(path: String) -> AppResult<String> {
+pub fn pick_and_read_file(
+    app: tauri::AppHandle,
+    filter_name: String,
+    extensions: Vec<String>,
+) -> AppResult<Option<String>> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let ext_refs: Vec<&str> = extensions.iter().map(String::as_str).collect();
+    let Some(picked) = app
+        .dialog()
+        .file()
+        .add_filter(&filter_name, &ext_refs)
+        .blocking_pick_file()
+    else {
+        return Ok(None);
+    };
+    let path = picked
+        .into_path()
+        .map_err(|e| AppError::other(e.to_string()))?;
     let bytes = std::fs::read(&path)?;
-    let mime = mime_for_path(&path);
-    Ok(format!(
+    let mime = mime_for_path(path.to_string_lossy().as_ref());
+    Ok(Some(format!(
         "data:{};base64,{}",
         mime,
         base64::engine::general_purpose::STANDARD.encode(&bytes)
-    ))
+    )))
 }
 
+/// Shows a native "save file" dialog and, if the user picks a destination,
+/// writes the given data URL's bytes there. Same rationale as
+/// `pick_and_read_file`: the destination path is chosen by the OS dialog, not
+/// supplied by the webview.
 #[tauri::command]
-pub fn file_write_bytes(path: String, data_url: String) -> AppResult<()> {
+pub fn pick_and_write_file(
+    app: tauri::AppHandle,
+    default_name: String,
+    filter_name: String,
+    extensions: Vec<String>,
+    data_url: String,
+) -> AppResult<bool> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let ext_refs: Vec<&str> = extensions.iter().map(String::as_str).collect();
+    let Some(picked) = app
+        .dialog()
+        .file()
+        .set_file_name(&default_name)
+        .add_filter(&filter_name, &ext_refs)
+        .blocking_save_file()
+    else {
+        return Ok(false);
+    };
+    let path = picked
+        .into_path()
+        .map_err(|e| AppError::other(e.to_string()))?;
     let (_, bytes) = parse_data_url(&data_url)?;
     std::fs::write(&path, bytes)?;
-    Ok(())
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -786,6 +832,8 @@ pub async fn classbox_open_note(
         title: result.title,
         room,
         room_id,
+        // Pulled from a classroom room, not a local file.
+        file_name: None,
     })
 }
 

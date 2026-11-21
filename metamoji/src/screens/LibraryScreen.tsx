@@ -162,26 +162,15 @@ export function LibraryScreen() {
   };
 
   const importAtdoc = async () => {
-    const selected = await open({
-      multiple: false,
-      filters: [
-        { name: "MetaMoJi ノート", extensions: ["atdoc", "atdo", "dat", "product", "state"] },
-        { name: "すべてのファイル", extensions: ["*"] },
-      ],
-    });
-    if (typeof selected !== "string") return;
-
     setImporting(true);
     setError(null);
     try {
       const noteId = newNoteId();
-      const result = await api.atdocImport(selected, noteId);
+      const result = await api.pickAndImportAtdoc(noteId);
+      if (!result) return;
       // The document's own name beats the file's: a note copied out of a class
       // box is called something like `doc_1730.atdoc` on disk.
-      const title =
-        result.title ??
-        selected.split("/").pop()?.replace(/\.[^.]+$/, "") ??
-        t("取り込んだノート");
+      const title = result.title ?? result.fileName ?? t("取り込んだノート");
       await renderBackgrounds(noteId, result.tree);
       await api.libraryCreate(result.tree, title);
       await refresh();
