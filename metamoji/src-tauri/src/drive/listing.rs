@@ -60,6 +60,11 @@ const FOLDERS: &str = "folderdefs_";
 const ORDERS: &str = "childrenorders_";
 const KNOWN_BUT_UNUSED: [&str; 4] = ["tagdefs_", "tagorder.json", "drive.json", "meta.json"];
 
+/// Caps how much of one entry's decompressed text this reads. Real entries
+/// (`documents_N.json` etc.) are a few KB to a few hundred KB; a sync payload
+/// claiming to need more than this is a decompression bomb, not real data.
+const MAX_ENTRY_TEXT_LEN: u64 = 32 * 1024 * 1024;
+
 /// Decodes the zip a drive hands back.
 pub fn parse(bytes: Vec<u8>) -> AppResult<Listing> {
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
@@ -84,7 +89,12 @@ pub fn parse(bytes: Vec<u8>) -> AppResult<Listing> {
         let name = full.rsplit('/').next().unwrap_or(&full).to_string();
 
         let mut text = String::new();
-        if entry.read_to_string(&mut text).is_err() {
+        if entry
+            .by_ref()
+            .take(MAX_ENTRY_TEXT_LEN)
+            .read_to_string(&mut text)
+            .is_err()
+        {
             unrecognised.push(name);
             continue;
         }
