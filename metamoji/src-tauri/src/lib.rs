@@ -36,49 +36,96 @@ pub struct AtdocImportResult {
     /// The room itself, so the caller can remember it with the note.
     #[serde(rename = "roomId")]
     pub room_id: Option<String>,
+    /// The imported file's own name (without extension), for a note imported
+    /// from a dialog-picked local file. `None` for a note pulled from a
+    /// classroom room, which has no local file of its own.
+    #[serde(rename = "fileName")]
+    pub file_name: Option<String>,
 }
 
-/// Imports a `.atdoc` file the user picked in a dialog.
+/// Shows a native "open file" dialog for a `.atdoc` file and, if the user
+/// picks one, imports it.
+///
+/// The pick and the read happen in the same call so the webview never gets
+/// to hand this command a path of its own choosing — see
+/// `reports/vulnerabilities/001_arbitrary-file-read-write-via-ipc.md`, which
+/// reported the same issue for `file_read_data_url`/`file_write_bytes`.
 ///
 /// See `atdoc/mod.rs` for the fidelity breakdown. Structure, properties and
 /// handwriting all come across; per-point pressure and rich-text bodies do not.
 /// The returned report states exactly what was recovered rather than leaving the
 /// user to guess from a half-populated note.
 #[tauri::command]
-fn atdoc_import(
+fn pick_and_import_atdoc(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
-    path: String,
     new_root_id: String,
-) -> AppResult<AtdocImportResult> {
+) -> AppResult<Option<AtdocImportResult>> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let Some(picked) = app
+        .dialog()
+        .file()
+        .add_filter(
+            "MetaMoJi ノート",
+            &["atdoc", "atdo", "dat", "product", "state"],
+        )
+        .add_filter("すべてのファイル", &["*"])
+        .blocking_pick_file()
+    else {
+        return Ok(None);
+    };
+    let path = picked
+        .into_path()
+        .map_err(|e| AppError::other(e.to_string()))?;
+    // The document's own title (set below from `result.title`) beats the file
+    // name when both are available, but a class-box export like
+    // `doc_1730.atdoc` has none, so the caller falls back to this.
+    let file_name = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned());
+
     let bytes = std::fs::read(&path).map_err(AppError::Io)?;
     let result = atdoc::import(bytes, &new_root_id)?;
     commands::store_imported_assets(&state, &new_root_id, result.assets)?;
-    Ok(AtdocImportResult {
+    Ok(Some(AtdocImportResult {
         tree: result.tree,
         report: result.report,
         title: result.title,
         // A file on disk belongs to no room.
         room: None,
         room_id: None,
-    })
+        file_name,
+    }))
 }
 
-/// Reports whether a file looks like something we can import, without reading
-/// all of it — used to give the file picker honest feedback.
+/// Shows a native "save file" dialog and, if the user picks a destination,
+/// writes the note out as a PDF there. Pages arrive already rendered, so the
+/// export matches the screen exactly — see `export.rs` for why that trade was
+/// made. Same path-brokering rationale as `pick_and_import_atdoc`.
 #[tauri::command]
-fn atdoc_probe(path: String) -> AppResult<u16> {
-    // The file may be a ZIP wrapping the container, so this reads the whole
-    // thing rather than sniffing a fixed-size head.
-    let bytes = std::fs::read(&path)?;
-    let raw = atdoc::unwrap_container(bytes)?;
-    Ok(atdoc::parse_header(&raw)?.format_version)
-}
+fn pick_and_export_pdf(
+    app: tauri::AppHandle,
+    default_name: String,
+    title: String,
+    pages: Vec<export::ExportPage>,
+) -> AppResult<bool> {
+    use tauri_plugin_dialog::DialogExt;
 
-/// Writes the note out as a PDF. Pages arrive already rendered, so the export
-/// matches the screen exactly — see `export.rs` for why that trade was made.
-#[tauri::command]
-fn export_pdf(path: String, title: String, pages: Vec<export::ExportPage>) -> AppResult<()> {
-    export::write_pdf(&path, &title, &pages)
+    let Some(picked) = app
+        .dialog()
+        .file()
+        .set_file_name(&default_name)
+        .add_filter("PDF", &["pdf"])
+        .blocking_save_file()
+    else {
+        return Ok(false);
+    };
+    let path = picked
+        .into_path()
+        .map_err(|e| AppError::other(e.to_string()))?;
+    export::write_pdf(path.to_string_lossy().as_ref(), &title, &pages)?;
+    Ok(true)
 }
 
 /// The environment values the ClassShare protocol wants on every request.
@@ -240,8 +287,8 @@ pub fn run() {
             commands::asset_put,
             commands::asset_get,
             commands::asset_list,
-            commands::file_read_data_url,
-            commands::file_write_bytes,
+            commands::pick_and_read_file,
+            commands::pick_and_write_file,
             commands::cloud_root_server,
             commands::cloud_set_root_server,
             commands::cloud_resolve_school,
@@ -271,9 +318,8 @@ pub fn run() {
             commands::classnote_unwatch,
             commands::classbox_note_thumbnail,
             commands::classbox_close,
-            atdoc_import,
-            atdoc_probe,
-            export_pdf,
+            pick_and_import_atdoc,
+            pick_and_export_pdf,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
