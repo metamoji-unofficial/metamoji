@@ -8,7 +8,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router";
-import { open, save as saveDialog } from "@tauri-apps/plugin-dialog";
+import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 
 import type { CanvasController, ToolMode } from "../canvas/controller";
 import { CanvasHost } from "../components/CanvasHost";
@@ -515,13 +515,9 @@ export function EditorScreen() {
       }
 
       if (tool === "image") {
-        const selected = await open({
-          multiple: false,
-          filters: [{ name: "画像", extensions: ["png", "jpg", "jpeg", "gif", "webp"] }],
-        });
-        if (typeof selected !== "string") return;
+        const dataUrl = await api.pickAndReadFile("画像", ["png", "jpg", "jpeg", "gif", "webp"]);
+        if (!dataUrl) return;
 
-        const dataUrl = await api.fileReadDataUrl(selected);
         const size = await imageSize(dataUrl);
         const ticket = newTicket();
         await api.assetPut(nid, ticket, dataUrl);
@@ -614,11 +610,6 @@ export function EditorScreen() {
     const state = useEditorStore.getState();
     const p = state.doc?.pages[state.pageIndex];
     if (!state.doc || !p) return;
-    const path = await saveDialog({
-      defaultPath: `${state.doc.meta.title}-${state.pageIndex + 1}.png`,
-      filters: [{ name: "PNG", extensions: ["png"] }],
-    });
-    if (!path) return;
 
     setBusy(t("画像を書き出しています…"));
     try {
@@ -626,7 +617,12 @@ export function EditorScreen() {
         assets,
         scale: EXPORT_DPI.print / 150,
       });
-      await api.fileWriteBytes(path, dataUrl);
+      await api.pickAndWriteFile(
+        `${state.doc.meta.title}-${state.pageIndex + 1}.png`,
+        "PNG",
+        ["png"],
+        dataUrl,
+      );
     } catch (err) {
       setLoadError(t("画像の書き出しに失敗しました: {error}", { error: String(err) }));
     } finally {
@@ -647,15 +643,10 @@ export function EditorScreen() {
     const { session: s, doc: d, noteId: nid } = state;
     if (!s || !d || !nid) return;
 
-    const selected = await open({
-      multiple: false,
-      filters: [{ name: "PDF", extensions: ["pdf"] }],
-    });
-    if (typeof selected !== "string") return;
-
     setBusy(t("PDF を読み込んでいます…"));
     try {
-      const dataUrl = await api.fileReadDataUrl(selected);
+      const dataUrl = await api.pickAndReadFile("PDF", ["pdf"]);
+      if (!dataUrl) return;
       const info = await readPdfInfo(dataUrl);
       const numbers = parsePageRange("", info.pageCount);
       const paperWidth = d.pages[state.pageIndex]?.paperWidth ?? 1240;

@@ -327,14 +327,36 @@ export async function assetList(noteId: string): Promise<string[]> {
   return invoke<string[]>("asset_list", { noteId });
 }
 
-export async function fileReadDataUrl(path: string): Promise<string> {
+/**
+ * Shows a native "open file" dialog and reads the picked file as a data URL.
+ * The path is chosen and resolved entirely on the Rust side, so the webview
+ * never gets to hand the backend a filesystem path of its own choosing.
+ */
+export async function pickAndReadFile(
+  filterName: string,
+  extensions: string[],
+): Promise<string | null> {
   if (!isTauri()) throw new Error("ファイルの読み込みはデスクトップアプリでのみ利用できます");
-  return invoke<string>("file_read_data_url", { path });
+  return invoke<string | null>("pick_and_read_file", { filterName, extensions });
 }
 
-export async function fileWriteBytes(path: string, dataUrl: string): Promise<void> {
+/**
+ * Shows a native "save file" dialog and writes the data URL's bytes to the
+ * picked destination. Returns false if the user cancelled the dialog.
+ */
+export async function pickAndWriteFile(
+  defaultName: string,
+  filterName: string,
+  extensions: string[],
+  dataUrl: string,
+): Promise<boolean> {
   if (!isTauri()) throw new Error("ファイルの書き出しはデスクトップアプリでのみ利用できます");
-  return invoke("file_write_bytes", { path, dataUrl });
+  return invoke<boolean>("pick_and_write_file", {
+    defaultName,
+    filterName,
+    extensions,
+    dataUrl,
+  });
 }
 
 // ---------------------------------------------------------------------------
