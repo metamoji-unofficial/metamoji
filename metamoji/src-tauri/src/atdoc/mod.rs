@@ -93,6 +93,12 @@ pub struct AtdocImport {
     pub assets: Vec<ImportedAsset>,
 }
 
+/// A zip entry's declared size is metadata, not a guarantee — a crafted
+/// archive can claim any value regardless of how much data actually follows.
+/// No real note gets anywhere near this; it only exists to stop that claim
+/// from becoming an upfront allocation.
+const MAX_REASONABLE_ENTRY_SIZE: u64 = 512 * 1024 * 1024;
+
 /// Extracts the raw `StateData` bytes from whatever the user handed us.
 ///
 /// A `.atdoc` may be the container directly, or a ZIP holding it — the bundled
@@ -124,7 +130,13 @@ pub fn unwrap_container(bytes: Vec<u8>) -> AppResult<Vec<u8>> {
             let mut entry = archive
                 .by_index(i)
                 .map_err(|e| AppError::other(format!("cannot read archive entry: {e}")))?;
-            let mut out = Vec::with_capacity(entry.size() as usize);
+            let declared_size = entry.size();
+            if declared_size > MAX_REASONABLE_ENTRY_SIZE {
+                return Err(AppError::Unsupported(
+                    "archive entry claims an unreasonably large size".into(),
+                ));
+            }
+            let mut out = Vec::with_capacity(declared_size as usize);
             entry.read_to_end(&mut out)?;
             return Ok(out);
         }
