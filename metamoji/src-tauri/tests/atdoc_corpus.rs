@@ -187,14 +187,14 @@ fn an_imported_document_survives_being_saved_and_reopened() {
     let now = now_iso();
 
     {
-        let mut store = NoteStore::open(&paths.note_path("note_imported")).expect("open");
+        let mut store = NoteStore::open(&paths.note_path("note_imported").expect("valid note_id")).expect("open");
         store
             .write_tree(&imported.tree, "取り込み", &now, &now, 0)
             .expect("write");
     }
 
     let reopened = {
-        let store = NoteStore::open(&paths.note_path("note_imported")).expect("reopen");
+        let store = NoteStore::open(&paths.note_path("note_imported").expect("valid note_id")).expect("reopen");
         store.read_tree().expect("read")
     };
 

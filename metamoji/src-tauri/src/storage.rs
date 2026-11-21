@@ -43,8 +43,19 @@ impl AppPaths {
         })
     }
 
-    pub fn note_path(&self, id: &str) -> PathBuf {
-        self.notes_dir.join(format!("{id}.mmnote"))
+    pub fn note_path(&self, id: &str) -> AppResult<PathBuf> {
+        // `id` is an IPC-supplied string. This app only ever issues UUID-shaped
+        // ids itself, so traversal/separator characters here can only mean the
+        // webview boundary is being abused.
+        if id.is_empty()
+            || id.contains('/')
+            || id.contains('\\')
+            || id.contains("..")
+            || Path::new(id).is_absolute()
+        {
+            return Err(AppError::other("不正な note_id です"));
+        }
+        Ok(self.notes_dir.join(format!("{id}.mmnote")))
     }
 }
 

@@ -286,12 +286,22 @@ fn split_children(value: Option<&str>) -> Vec<String> {
 }
 
 /// A folder path with exactly one slash at each end.
+///
+/// `.`/`..` segments are dropped outright: this is a display hierarchy coming
+/// straight off a document's `tags` field (sync data, not trusted input), and
+/// it later gets joined onto a real filesystem path in
+/// `commands::sub_directory`, so a traversal segment surviving here would
+/// become one there.
 fn normalise_path(path: &str) -> String {
     let trimmed = path.trim().trim_matches('/');
-    if trimmed.is_empty() {
+    let cleaned: Vec<&str> = trimmed
+        .split('/')
+        .filter(|seg| !seg.is_empty() && *seg != "." && *seg != "..")
+        .collect();
+    if cleaned.is_empty() {
         "/".to_string()
     } else {
-        format!("/{trimmed}/")
+        format!("/{}/", cleaned.join("/"))
     }
 }
 

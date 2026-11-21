@@ -60,7 +60,7 @@ impl AppState {
         if let Some(store) = self.open_notes.read().unwrap().get(id) {
             return Ok(Arc::clone(store));
         }
-        let path = self.paths.note_path(id);
+        let path = self.paths.note_path(id)?;
         let store = Arc::new(Mutex::new(NoteStore::open(&path)?));
         self.open_notes
             .write()

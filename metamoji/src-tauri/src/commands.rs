@@ -160,7 +160,7 @@ pub fn library_create(
     title: String,
 ) -> AppResult<NoteSummary> {
     let id = tree.root_id.clone();
-    let path = state.paths.note_path(&id);
+    let path = state.paths.note_path(&id)?;
     let now = now_iso();
 
     {
@@ -229,7 +229,7 @@ pub fn library_duplicate(
     title: String,
 ) -> AppResult<NoteSummary> {
     let src = state.catalog.lock().unwrap().path_of(&id)?;
-    let dst = state.paths.note_path(&new_id);
+    let dst = state.paths.note_path(&new_id)?;
     std::fs::copy(&src, &dst)?;
 
     let now = now_iso();
@@ -267,7 +267,7 @@ pub fn library_duplicate(
 
 #[tauri::command]
 pub fn note_load(state: State<'_, AppState>, id: String) -> AppResult<GenericTree> {
-    let path = state.paths.note_path(&id);
+    let path = state.paths.note_path(&id)?;
     if !path.exists() {
         return Err(AppError::NoteNotFound(id));
     }
@@ -297,7 +297,7 @@ pub fn note_save(
         .write_tree(&tree, &title, &created_at, &now, revision)?;
 
     let page_count = count_pages(&tree);
-    let path = state.paths.note_path(&id);
+    let path = state.paths.note_path(&id)?;
     state.catalog.lock().unwrap().upsert(
         &id,
         &path,
@@ -1461,10 +1461,17 @@ fn sub_directory(dest_dir: &str, folder_path: &str, doc_folder_path: &str) -> Pa
         .unwrap_or(doc_folder_path)
         .trim_matches('/');
     if rest.is_empty() {
-        PathBuf::from(dest_dir)
-    } else {
-        PathBuf::from(dest_dir).join(rest)
+        return PathBuf::from(dest_dir);
     }
+    // `rest` comes from `drive::listing::normalise_path`, which already drops
+    // `.`/`..` segments — this is a second, independent check against the
+    // same class of input, in case a future caller feeds `sub_directory`
+    // something that skipped that normalisation.
+    let safe_rest: PathBuf = rest
+        .split('/')
+        .filter(|seg| !seg.is_empty() && *seg != "." && *seg != "..")
+        .collect();
+    PathBuf::from(dest_dir).join(safe_rest)
 }
 
 /// Characters no mainstream filesystem accepts in a file name, plus the ones

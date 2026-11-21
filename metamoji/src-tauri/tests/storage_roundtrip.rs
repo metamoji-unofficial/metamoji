@@ -70,7 +70,7 @@ fn sample_tree(root: &str) -> GenericTree {
 fn a_note_reopens_with_its_tree_intact() {
     let dir = tmp_dir("roundtrip");
     let paths = AppPaths::new(dir.clone()).expect("paths");
-    let path = paths.note_path("note_1");
+    let path = paths.note_path("note_1").expect("valid note_id");
     let tree = sample_tree("note_1");
     let now = now_iso();
 
@@ -112,7 +112,7 @@ fn a_note_reopens_with_its_tree_intact() {
 fn saving_twice_replaces_rather_than_accumulates() {
     let dir = tmp_dir("resave");
     let paths = AppPaths::new(dir.clone()).expect("paths");
-    let path = paths.note_path("note_2");
+    let path = paths.note_path("note_2").expect("valid note_id");
     let now = now_iso();
 
     let mut store = NoteStore::open(&path).expect("open");
@@ -149,7 +149,7 @@ fn saving_twice_replaces_rather_than_accumulates() {
 fn assets_survive_a_reopen() {
     let dir = tmp_dir("assets");
     let paths = AppPaths::new(dir.clone()).expect("paths");
-    let path = paths.note_path("note_3");
+    let path = paths.note_path("note_3").expect("valid note_id");
     let bytes = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
 
     {
@@ -179,17 +179,17 @@ fn the_catalog_lists_indexes_and_trashes_notes() {
     let now = now_iso();
 
     catalog
-        .upsert("n1", &paths.note_path("n1"), "一つ目", &now, &now, 2, 0)
+        .upsert("n1", &paths.note_path("n1").expect("valid note_id"), "一つ目", &now, &now, 2, 0)
         .expect("upsert");
     catalog
-        .upsert("n2", &paths.note_path("n2"), "二つ目", &now, &now, 1, 0)
+        .upsert("n2", &paths.note_path("n2").expect("valid note_id"), "二つ目", &now, &now, 1, 0)
         .expect("upsert");
 
     assert_eq!(catalog.list(&ListQuery::default()).expect("list").len(), 2);
 
     // Upsert on an existing id updates rather than duplicating.
     catalog
-        .upsert("n1", &paths.note_path("n1"), "改題", &now, &now, 5, 7)
+        .upsert("n1", &paths.note_path("n1").expect("valid note_id"), "改題", &now, &now, 5, 7)
         .expect("re-upsert");
     let notes = catalog.list(&ListQuery::default()).expect("list");
     assert_eq!(notes.len(), 2);
@@ -237,7 +237,7 @@ fn the_catalog_lists_indexes_and_trashes_notes() {
 fn a_tree_with_no_metadata_row_is_an_error_not_a_panic() {
     let dir = tmp_dir("empty");
     let paths = AppPaths::new(dir.clone()).expect("paths");
-    let store = NoteStore::open(&paths.note_path("note_4")).expect("open");
+    let store = NoteStore::open(&paths.note_path("note_4").expect("valid note_id")).expect("open");
     // Freshly created file: schema exists, but nothing was ever written.
     assert!(store.read_tree().is_err());
     std::fs::remove_dir_all(&dir).ok();
@@ -271,10 +271,10 @@ fn folders_hold_notes_and_release_them_when_deleted() {
     let now = now_iso();
 
     catalog
-        .upsert("n1", &paths.note_path("n1"), "一つ目", &now, &now, 1, 0)
+        .upsert("n1", &paths.note_path("n1").expect("valid note_id"), "一つ目", &now, &now, 1, 0)
         .expect("upsert");
     catalog
-        .upsert("n2", &paths.note_path("n2"), "二つ目", &now, &now, 1, 0)
+        .upsert("n2", &paths.note_path("n2").expect("valid note_id"), "二つ目", &now, &now, 1, 0)
         .expect("upsert");
 
     catalog.create_folder("f1", "授業", None).expect("folder");
@@ -319,10 +319,10 @@ fn tags_attach_to_notes_and_filter_the_list() {
     let now = now_iso();
 
     catalog
-        .upsert("n1", &paths.note_path("n1"), "一つ目", &now, &now, 1, 0)
+        .upsert("n1", &paths.note_path("n1").expect("valid note_id"), "一つ目", &now, &now, 1, 0)
         .expect("upsert");
     catalog
-        .upsert("n2", &paths.note_path("n2"), "二つ目", &now, &now, 1, 0)
+        .upsert("n2", &paths.note_path("n2").expect("valid note_id"), "二つ目", &now, &now, 1, 0)
         .expect("upsert");
 
     let tag = catalog.create_tag("t1", "重要", "#d93025").expect("tag");
@@ -366,7 +366,7 @@ fn full_text_search_finds_notes_by_title_and_body() {
 
     for (id, title) in [("n1", "algebra notes"), ("n2", "history essay")] {
         catalog
-            .upsert(id, &paths.note_path(id), title, &now, &now, 1, 0)
+            .upsert(id, &paths.note_path(id).expect("valid note_id"), title, &now, &now, 1, 0)
             .expect("upsert");
     }
     catalog
