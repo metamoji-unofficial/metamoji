@@ -348,8 +348,14 @@ pub struct CloudClient {
 
 /// Everything needed to pick a session back up after a restart.
 ///
-/// Deliberately no `credential` field: that one goes through the OS credential
-/// store instead (`keyring_entry` and friends, above), not this file.
+/// No `credential` field is ever written here any more: that one goes through
+/// the OS credential store instead (`keyring_entry` and friends, above). It is
+/// still read (`#[serde(skip_serializing)]`), because a `session.json` written
+/// before that change still has one in plain JSON — without reading it back
+/// once, upgrading from that build silently drops the credential, leaving
+/// `session` (so the UI still looks signed in) with no way to silently
+/// re-authenticate, and every lapsed cookie permanently surfacing
+/// "サインインの有効期限が切れました" with no recovery in sight.
 #[derive(Default, Serialize, Deserialize)]
 struct Persisted {
     root_server: Option<String>,
@@ -358,6 +364,8 @@ struct Persisted {
     session: Option<CloudSession>,
     method: Option<LoginMethod>,
     cookies: Option<Value>,
+    #[serde(skip_serializing)]
+    credential: Option<Credential>,
 }
 
 impl CloudClient {
@@ -399,6 +407,17 @@ impl CloudClient {
             .then(|| load_credential_from_keyring(store_path.as_ref()))
             .flatten();
 
+        // One-time migration: a keyring with nothing in it yet, but a
+        // `session.json` written before the keyring existed, means the
+        // credential is still sitting in `saved.credential` (see `Persisted`'s
+        // doc comment) rather than lost. Moving it into the keyring now is
+        // what makes this the only launch that ever needs to.
+        let credential = credential.or_else(|| {
+            let legacy = saved.credential.clone()?;
+            save_credential_to_keyring(store_path.as_ref(), Some(&legacy));
+            Some(legacy)
+        });
+
         Ok(Self {
             http,
             cookies,
@@ -436,6 +455,9 @@ impl CloudClient {
                 school: inner.school.clone(),
                 session: inner.session.clone(),
                 method: inner.method.clone(),
+                // Never serialized (`#[serde(skip_serializing)]`); only here
+                // because the struct needs a value at all.
+                credential: None,
                 cookies: {
                     let mut buffer = Vec::new();
                     let store = self.cookies.lock().unwrap();
@@ -1588,5 +1610,69 @@ mod tests {
         assert_eq!(urlencode("a b&c=d"), "a%20b%26c%3Dd");
         // Non-ASCII goes out as UTF-8 percent triples, not as raw bytes.
         assert_eq!(urlencode("学"), "%E5%AD%A6");
+    }
+
+    /// Before the OS keyring existed, `session.json` carried the credential
+    /// itself (plain JSON). An upgrade must not silently drop it on the floor —
+    /// `Persisted::credential` is still *read* (never written again) for
+    /// exactly this one-time move, or every install that signed in before this
+    /// change loses the one thing that lets a lapsed cookie renew itself.
+    #[test]
+    fn a_legacy_plaintext_credential_is_migrated_into_the_keyring() {
+        let path = std::env::temp_dir().join(format!(
+            "metamoji-legacy-credential-test-{}-{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        save_credential_to_keyring(Some(&path), None);
+
+        let legacy = Persisted {
+            session: Some(CloudSession {
+                user_id: "u-1".into(),
+                login_name: "student01".into(),
+                name: "Student".into(),
+                email: None,
+                co_login_id: "school01".into(),
+                company_id: None,
+                company_name: None,
+                is_class_room: false,
+                is_on_premise: false,
+                rest_host: "https://example.invalid/".into(),
+            }),
+            ..Persisted::default()
+        };
+        // `Persisted::credential` is `#[serde(skip_serializing)]`, so it cannot
+        // be set through the struct literal above — it has to be spliced into
+        // the written JSON directly, the way an old build's own (un-skipped)
+        // `Serialize` impl would have produced it.
+        let mut value = serde_json::to_value(&legacy).unwrap();
+        value.as_object_mut().unwrap().insert(
+            "credential".into(),
+            serde_json::to_value(Credential::Password("hunter2".into())).unwrap(),
+        );
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+
+        let client = CloudClient::new(
+            "m".into(),
+            "ja_JP".into(),
+            "Asia/Tokyo".into(),
+            Some(path.clone()),
+        )
+        .unwrap();
+
+        assert!(
+            client.collabo_identity().is_some(),
+            "the legacy credential must be picked up on this first launch"
+        );
+        assert!(
+            matches!(
+                load_credential_from_keyring(Some(&path)),
+                Some(Credential::Password(p)) if p == "hunter2"
+            ),
+            "and moved into the keyring so this is the only launch that ever needs to"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }
