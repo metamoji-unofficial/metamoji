@@ -232,3 +232,13 @@ export const useAuthStore = create<AuthState>((set) => ({
 export function isSignedIn(): boolean {
   return useAuthStore.getState().session !== null;
 }
+
+// A cloud/classbox/classroom call can fail long after sign-in with the one
+// error that means the stored session is gone for good (see
+// `api.onSessionExpired`'s doc comment). Without this, the UI keeps showing a
+// signed-in account that every action rejects, since nothing else ever clears
+// `session` back to null.
+api.onSessionExpired(() => {
+  adoptSession(null);
+  useAuthStore.setState({ session: null, error: api.SESSION_EXPIRED_MESSAGE });
+});

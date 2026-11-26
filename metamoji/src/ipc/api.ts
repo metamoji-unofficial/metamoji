@@ -5,11 +5,37 @@
  * has exactly one definition site. `invoke` is never called anywhere else.
  */
 
-import { invoke } from "@tauri-apps/api/core";
+import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { GenericModel, GenericTree } from "../model/generic";
 import { api } from "../api/client";
 import { memoryBackend } from "./memoryBackend";
+
+// Exactly `AppError::NotLoggedIn`'s Display text (src-tauri/src/error.rs) —
+// the one error every cloud/classbox/classroom command can surface once the
+// stored session cookie is no longer accepted and there is no credential left
+// to silently re-authenticate with (e.g. a credential never migrated into the
+// OS keyring from a build that predates it). Nothing here clears the
+// session state that made the signed-in UI show up in the first place, so
+// without this it reappears on every retry rather than once.
+export const SESSION_EXPIRED_MESSAGE =
+  "サインインの有効期限が切れました。もう一度サインインしてください。";
+
+let sessionExpiredHandler: (() => void) | null = null;
+
+/** Registered once by `authStore`, so this layer never imports it directly. */
+export function onSessionExpired(handler: () => void): void {
+  sessionExpiredHandler = handler;
+}
+
+async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  try {
+    return await tauriInvoke<T>(cmd, args);
+  } catch (err) {
+    if (err === SESSION_EXPIRED_MESSAGE) sessionExpiredHandler?.();
+    throw err;
+  }
+}
 
 export interface Tag {
   id: string;
